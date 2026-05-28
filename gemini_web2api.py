@@ -182,6 +182,111 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
     raise last_err
 
 
+def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
+    """Generator that yields text deltas from Gemini StreamGenerate in real time."""
+    inner = [None] * 80
+    inner[0] = [prompt, 0, None, None, None, None, 0]
+    inner[1] = ["en"]
+    inner[2] = ["", "", "", None, None, None, None, None, None, ""]
+    inner[6] = [0]
+    inner[7] = 1
+    inner[10] = 1
+    inner[11] = 0
+    inner[17] = [[think_mode]]
+    inner[18] = 0
+    inner[27] = 1
+    inner[30] = [4]
+    inner[41] = [2]
+    inner[53] = 0
+    inner[59] = str(uuid.uuid4())
+    inner[61] = []
+    inner[68] = 1
+    inner[79] = model_id
+
+    outer = [None, json.dumps(inner)]
+    body = urllib.parse.urlencode({"f.req": json.dumps(outer)}).encode()
+    reqid = int(time.time()) % 1000000
+    url = (
+        "https://gemini.google.com/_/BardChatUi/data/"
+        "assistant.lamda.BardFrontendService/StreamGenerate"
+        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+    )
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://gemini.google.com",
+        "Referer": "https://gemini.google.com/app",
+        "X-Same-Domain": "1",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+
+    cookie_str, sapisid = load_cookie()
+    if cookie_str:
+        headers["Cookie"] = cookie_str
+    if sapisid:
+        headers["Authorization"] = make_sapisidhash(sapisid)
+
+    last_err = None
+    resp = None
+    for attempt in range(CONFIG["retry_attempts"]):
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            ctx = ssl.create_default_context()
+            proxy = CONFIG.get("proxy")
+            if proxy:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                    urllib.request.HTTPSHandler(context=ctx)
+                )
+                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+            else:
+                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
+
+    if resp is None:
+        raise last_err
+
+    try:
+        prev_text = ""
+        buf = b""
+        while True:
+            chunk = resp.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line_bytes, buf = buf.split(b"\n", 1)
+                line = line_bytes.decode("utf-8", errors="replace")
+                if '"wrb.fr"' not in line or len(line) < 200:
+                    continue
+                try:
+                    arr = json.loads(line)
+                    inner_str = arr[0][2]
+                    if not inner_str or len(inner_str) < 50:
+                        continue
+                    inner_data = json.loads(inner_str)
+                    if isinstance(inner_data, list) and len(inner_data) > 4 and inner_data[4]:
+                        current_text = ""
+                        for part in inner_data[4]:
+                            if isinstance(part, list) and len(part) > 1 and part[1]:
+                                if isinstance(part[1], list):
+                                    for t in part[1]:
+                                        if isinstance(t, str) and len(t) > 0:
+                                            current_text = t
+                        if current_text and len(current_text) > len(prev_text):
+                            delta = current_text[len(prev_text):]
+                            prev_text = current_text
+                            yield delta
+                except (json.JSONDecodeError, IndexError, TypeError):
+                    pass
+    finally:
+        resp.close()
+
+
 def clean_gemini_text(text: str) -> str:
     """Remove internal code execution artifacts."""
     text = re.sub(
@@ -383,30 +488,62 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
 
-        try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
-        except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-            return
-
-        cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        msg = {"role": "assistant", "content": text or None}
-        if tool_calls:
-            msg["tool_calls"] = tool_calls
-        finish = "tool_calls" if tool_calls else "stop"
-
         if req.get("stream"):
+            # ── Real streaming ──
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                     "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+
+            cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            created = int(time.time())
+
+            # Initial chunk: role
+            rc = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                  "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+            self.wfile.write(f"data: {json.dumps(rc)}\n\n".encode())
+            self.wfile.flush()
+
+            # Stream content deltas
+            full_text = ""
+            try:
+                for delta in gemini_stream_generate_iter(prompt, model_id, think_mode):
+                    full_text += delta
+                    cc = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                          "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(cc)}\n\n".encode())
+                    self.wfile.flush()
+            except Exception as e:
+                log(f"Stream error: {e}")
+
+            # Check for tool calls in accumulated text
+            finish = "stop"
+            if tools and full_text:
+                _, tc_list = parse_tool_calls(full_text)
+                if tc_list:
+                    finish = "tool_calls"
+
+            # Final chunk: finish_reason
+            fc = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                  "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
+            self.wfile.write(f"data: {json.dumps(fc)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         else:
+            # ── Non-streaming ──
+            try:
+                text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
+
+            cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            msg = {"role": "assistant", "content": text or None}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            finish = "tool_calls" if tool_calls else "stop"
+
             self.send_json({
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
                 "model": model_name,
@@ -472,44 +609,74 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
-        try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
-        except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-            return
-
-        rid = f"resp_{uuid.uuid4().hex[:16]}"
-        mid = f"msg_{uuid.uuid4().hex[:12]}"
-        output = []
-        if tool_calls:
-            for tc in tool_calls:
-                output.append({"type": "function_call", "id": tc["id"], "call_id": tc["id"],
-                               "name": tc["function"]["name"], "arguments": tc["function"]["arguments"], "status": "completed"})
-        if text or not tool_calls:
-            output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
-                           "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
-
         if req.get("stream"):
+            # ── Real streaming (Responses API) ──
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
+
+            rid = f"resp_{uuid.uuid4().hex[:16]}"
+            mid = f"msg_{uuid.uuid4().hex[:12]}"
+
             ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
             self.wfile.write(f"event: response.created\ndata: {json.dumps(ev)}\n\n".encode())
-            for item in output:
-                if item["type"] == "function_call":
-                    ev = {"type": "response.function_call_arguments.done", "item_id": item["id"], "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}
-                    self.wfile.write(f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n".encode())
-                elif item["type"] == "message":
-                    for ci, cp in enumerate(item["content"]):
-                        ev = {"type": "response.output_text.done", "item_id": item["id"], "content_index": ci, "text": cp["text"]}
-                        self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
+            self.wfile.flush()
+
+            full_text = ""
+            try:
+                for delta in gemini_stream_generate_iter(prompt, model_id, think_mode):
+                    full_text += delta
+                    ev = {"type": "response.output_text.delta", "item_id": mid, "content_index": 0, "text": delta}
+                    self.wfile.write(f"event: response.output_text.delta\ndata: {json.dumps(ev)}\n\n".encode())
+                    self.wfile.flush()
+            except Exception as e:
+                log(f"Stream error: {e}")
+
+            text = clean_gemini_text(full_text) if full_text else ""
+            output = []
+            tool_calls = None
+            if tools and full_text:
+                _, tc_list = parse_tool_calls(full_text)
+                if tc_list:
+                    tool_calls = tc_list
+                    for tc in tool_calls:
+                        output.append({"type": "function_call", "id": tc["id"], "call_id": tc["id"],
+                                       "name": tc["function"]["name"], "arguments": tc["function"]["arguments"], "status": "completed"})
+                        ev = {"type": "response.function_call_arguments.done", "item_id": tc["id"], "call_id": tc["id"],
+                              "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
+                        self.wfile.write(f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n".encode())
+
+            if text or not tool_calls:
+                output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
+                               "content": [{"type": "output_text", "text": text, "annotations": []}]})
+                ev = {"type": "response.output_text.done", "item_id": mid, "content_index": 0, "text": text}
+                self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
+
             resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
                         "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}}
             self.wfile.write(f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n".encode())
             self.wfile.flush()
         else:
+            # ── Non-streaming (Responses API) ──
+            try:
+                text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
+
+            rid = f"resp_{uuid.uuid4().hex[:16]}"
+            mid = f"msg_{uuid.uuid4().hex[:12]}"
+            output = []
+            if tool_calls:
+                for tc in tool_calls:
+                    output.append({"type": "function_call", "id": tc["id"], "call_id": tc["id"],
+                                   "name": tc["function"]["name"], "arguments": tc["function"]["arguments"], "status": "completed"})
+            if text or not tool_calls:
+                output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
+                               "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
+
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
                             "model": model_name, "output": output,
                             "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}})
