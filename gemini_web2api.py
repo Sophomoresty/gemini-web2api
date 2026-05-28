@@ -114,6 +114,32 @@ def make_sapisidhash(sapisid: str) -> str:
     return f"SAPISIDHASH {ts}_{h}"
 
 
+def auto_fetch_bl() -> str:
+    """Fetch latest gemini_bl value from Gemini homepage. Returns bl string or None."""
+    try:
+        req = urllib.request.Request(
+            "https://gemini.google.com/",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        ctx = ssl.create_default_context()
+        proxy = CONFIG.get("proxy")
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=ctx)
+            )
+            resp = opener.open(req, timeout=15)
+        else:
+            resp = urllib.request.urlopen(req, context=ctx, timeout=15)
+        html = resp.read().decode("utf-8", errors="replace")
+        match = re.search(r'(boq_assistant-bard-web-server_[a-zA-Z0-9._]+)', html)
+        if match:
+            return match.group(1)
+    except Exception as e:
+        log(f"auto_fetch_bl failed: {e}")
+    return None
+
+
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
 def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
@@ -547,6 +573,15 @@ def main():
         CONFIG["cookie_file"] = args.cookie_file
     if args.proxy:
         CONFIG["proxy"] = args.proxy
+
+    # Auto-fetch latest bl parameter
+    fetched_bl = auto_fetch_bl()
+    if fetched_bl:
+        if fetched_bl != CONFIG["gemini_bl"]:
+            log(f"bl updated: {CONFIG['gemini_bl']} -> {fetched_bl}")
+        CONFIG["gemini_bl"] = fetched_bl
+    else:
+        log(f"bl auto-fetch failed, using default: {CONFIG['gemini_bl']}")
 
     class ThreadedServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
