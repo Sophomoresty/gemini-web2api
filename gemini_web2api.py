@@ -250,7 +250,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
         return
 
     prev_text = ""
-    transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
+    transport = httpx.HTTPTransport(proxy=httpx.Proxy(proxy)) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
         with client.stream("POST", url, content=body, headers=headers) as resp:
             buf = ""
