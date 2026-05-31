@@ -8,6 +8,12 @@
   "api_keys": [
     "sk-gemini"
   ],
+  "web_username": "admin",
+  "web_password": "admin",
+  "session_secret": null,
+  "session_cookie": "gemini2api_session",
+  "session_ttl_sec": 86400,
+  "session_stats_file": null,
   "cookie_file": null,
   "proxy": null,
   "log_requests": true

@@ -45,6 +45,17 @@ def _get_httpx_client():
     return _httpx_client
 
 
+def reset_httpx_client():
+    """Close the cached httpx client so proxy/timeout changes can take effect."""
+    global _httpx_client
+    if _httpx_client is not None:
+        try:
+            _httpx_client.close()
+        except Exception:
+            pass
+    _httpx_client = None
+
+
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
     cookie_file = CONFIG.get("cookie_file")

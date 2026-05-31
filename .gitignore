@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 config.json
+session_stats.json
+session_stats.json.tmp
 cookie.txt
 cookie.json
 .env
