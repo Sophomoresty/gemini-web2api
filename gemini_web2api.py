@@ -414,15 +414,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path == "/v1/models":
+            path = self.path.split("?")[0]
+            if path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif path.startswith("/v1beta/models"):
                 self._handle_google_models_list()
-            elif self.path == "/":
+            elif path == "/":
                 self.send_json({"status": "ok", "version": __version__,
                                 "models": list(MODELS.keys())})
             else:
@@ -628,20 +629,47 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
-            self.wfile.write(f"event: response.created\ndata: {json.dumps(ev)}\n\n".encode())
+
+            def sse(event_type, data):
+                self.wfile.write(f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+
+            # 1. response.created
+            resp_in_progress = {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}
+            sse("response.created", {"type": "response.created", "response": resp_in_progress})
+
+            # 2. response.in_progress
+            sse("response.in_progress", {"type": "response.in_progress", "response": resp_in_progress})
+
             for item in output:
                 if item["type"] == "function_call":
-                    ev = {"type": "response.function_call_arguments.done", "item_id": item["id"], "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}
-                    self.wfile.write(f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n".encode())
+                    sse("response.output_item.added", {"type": "response.output_item.added", "output_index": 0, "item": item})
+                    sse("response.function_call_arguments.delta", {"type": "response.function_call_arguments.delta", "item_id": item["id"], "call_id": item["call_id"], "delta": item["arguments"]})
+                    sse("response.function_call_arguments.done", {"type": "response.function_call_arguments.done", "item_id": item["id"], "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]})
+                    sse("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": item})
                 elif item["type"] == "message":
+                    # 3. response.output_item.added
+                    sse("response.output_item.added", {"type": "response.output_item.added", "output_index": 0, "item": {"id": item["id"], "type": "message", "role": "assistant", "status": "in_progress", "content": []}})
                     for ci, cp in enumerate(item["content"]):
-                        ev = {"type": "response.output_text.done", "item_id": item["id"], "content_index": ci, "text": cp["text"]}
-                        self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
+                        # 4. response.content_part.added
+                        sse("response.content_part.added", {"type": "response.content_part.added", "item_id": item["id"], "output_index": 0, "content_index": ci, "part": {"type": "output_text", "text": "", "annotations": []}})
+                        # 5. response.output_text.delta (send text in chunks for streaming feel)
+                        full_text = cp["text"]
+                        chunk_size = 20
+                        for i in range(0, len(full_text), chunk_size):
+                            chunk = full_text[i:i+chunk_size]
+                            sse("response.output_text.delta", {"type": "response.output_text.delta", "item_id": item["id"], "output_index": 0, "content_index": ci, "delta": chunk})
+                        # 6. response.output_text.done
+                        sse("response.output_text.done", {"type": "response.output_text.done", "item_id": item["id"], "output_index": 0, "content_index": ci, "text": full_text})
+                        # 7. response.content_part.done
+                        sse("response.content_part.done", {"type": "response.content_part.done", "item_id": item["id"], "output_index": 0, "content_index": ci, "part": {"type": "output_text", "text": full_text, "annotations": []}})
+                    # 8. response.output_item.done
+                    sse("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": item})
+
+            # 9. response.completed
             resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
                         "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}}
-            self.wfile.write(f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n".encode())
-            self.wfile.flush()
+            sse("response.completed", {"type": "response.completed", "response": resp_obj})
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
                             "model": model_name, "output": output,
