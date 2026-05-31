@@ -24,10 +24,10 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero authen
 ## Quick Start
 
 ```bash
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
-Server starts at `http://localhost:8081/v1`.
+Server starts at `http://localhost:8081/v1`. The web admin console is available at `http://localhost:8081/admin` with the default login `admin` / `admin`; change it in `config.json` before exposing the service.
 
 ## Client Configuration
 
@@ -73,6 +73,17 @@ Supports Google native API endpoints:
 - `POST /v1beta/models/{model}:generateContent` — non-streaming
 - `POST /v1beta/models/{model}:streamGenerateContent` — streaming (SSE)
 
+## Web Admin
+
+Open `http://localhost:8081/admin` after startup. The console includes:
+
+- API key create, edit, delete, and copy actions
+- Available model list and call examples for supported APIs
+- Session statistics by model, API key, and recent requests
+- Proxy configuration and connectivity test
+- Streaming chat test page
+- Settings for default model, retry, timeout, logging, cookie file, and web login
+
 ## Available Models
 
 | Model | Description | Output |
@@ -99,7 +110,7 @@ gemini-3.5-flash-thinking@think=4   # shallowest
 Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, provide a cookie file:
 
 ```bash
-python gemini_web2api.py --cookie-file cookie.txt
+python -m gemini_web2api --cookie-file cookie.txt
 ```
 
 ### How to get cookies
@@ -134,6 +145,12 @@ Create `config.json` in the same directory:
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
   "api_keys": ["sk-your-key"],
+  "web_username": "admin",
+  "web_password": "change-me",
+  "session_secret": null,
+  "session_cookie": "gemini2api_session",
+  "session_ttl_sec": 86400,
+  "session_stats_file": null,
   "cookie_file": null,
   "proxy": null,
   "log_requests": true
@@ -171,7 +188,7 @@ If you cannot access `gemini.google.com` directly (connection timeout), configur
 
 **Method 1: CLI argument**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python -m gemini_web2api --proxy http://127.0.0.1:7890
 ```
 
 **Method 2: config.json**
@@ -182,12 +199,14 @@ python gemini_web2api.py --proxy http://127.0.0.1:7890
 **Method 3: Environment variable** (auto-detected)
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 Works with Clash, V2Ray, Shadowsocks, or any HTTP proxy.
 
 ## Tool Calling
+
+Tool calls are supported for both normal and streaming Chat Completions. The parser accepts OpenAI-style `tool_calls` JSON, legacy fenced `tool_call` blocks, and XML/DSML tool-call blocks, while filtering calls to the tools provided in the request.
 
 ```python
 resp = client.chat.completions.create(

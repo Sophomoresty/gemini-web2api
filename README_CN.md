@@ -24,10 +24,10 @@
 ## 快速开始
 
 ```bash
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
-服务启动在 `http://localhost:8081/v1`.
+服务启动在 `http://localhost:8081/v1`。Web 管理台地址是 `http://localhost:8081/admin`，默认登录账号密码为 `admin` / `admin`，对外暴露服务前请先在 `config.json` 中修改。
 
 ## 客户端配置
 
@@ -73,6 +73,17 @@ gemini
 - `POST /v1beta/models/{model}:generateContent` — 非流式生成
 - `POST /v1beta/models/{model}:streamGenerateContent` — 流式生成 (SSE)
 
+## Web 管理台
+
+启动后打开 `http://localhost:8081/admin`。管理台包含：
+
+- API 密钥创建、修改、删除和复制
+- 可用模型列表和当前支持接口的调用样例
+- 按模型、API 密钥、最近请求聚合的会话统计
+- 代理配置和连通性测试
+- 流式在线聊天测试页面
+- 默认模型、重试、超时、日志、Cookie 文件和 Web 登录信息设置
+
 ## 可用模型
 
 | 模型 | 说明 | 输出量 |
@@ -99,7 +110,7 @@ gemini-3.5-flash-thinking@think=4   # 最浅
 匿名访问对所有模型有效, 但 `gemini-3.1-pro` 在无认证时会路由到 Flash. 要获得真正的 Pro 路由, 提供 cookie 文件:
 
 ```bash
-python gemini_web2api.py --cookie-file cookie.txt
+python -m gemini_web2api --cookie-file cookie.txt
 ```
 
 ### 如何获取 Cookie
@@ -134,6 +145,12 @@ SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
   "api_keys": ["sk-your-key"],
+  "web_username": "admin",
+  "web_password": "change-me",
+  "session_secret": null,
+  "session_cookie": "gemini2api_session",
+  "session_ttl_sec": 86400,
+  "session_stats_file": null,
   "cookie_file": null,
   "proxy": null,
   "log_requests": true
@@ -171,7 +188,7 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 
 **方式 1: 命令行参数**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python -m gemini_web2api --proxy http://127.0.0.1:7890
 ```
 
 **方式 2: config.json**
@@ -182,10 +199,14 @@ python gemini_web2api.py --proxy http://127.0.0.1:7890
 **方式 3: 环境变量** (自动检测)
 ```bash
 set HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.
+
+## 工具调用
+
+Chat Completions 的非流式和流式请求都支持工具调用。解析器支持 OpenAI 风格的 `tool_calls` JSON、旧版 fenced `tool_call` 代码块、XML/DSML 工具调用块，并会按请求中声明的工具名过滤输出。
 
 ## 已知限制
 
