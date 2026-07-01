@@ -441,9 +441,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
         keys = CONFIG.get("api_keys") or []
         if not keys:
             return True
+        # Authorization: Bearer <key>
         auth = self.headers.get("Authorization", "")
-        key = auth[7:] if auth.startswith("Bearer ") else self.headers.get("x-api-key", "")
-        return key in keys
+        if auth.startswith("Bearer ") and auth[7:] in keys:
+            return True
+        # header keys (OpenAI x-api-key / Google x-goog-api-key)
+        for h in ("x-api-key", "x-goog-api-key"):
+            if self.headers.get(h, "") in keys:
+                return True
+        # query param ?key= (Gemini CLI native style)
+        if "?" in self.path:
+            for pair in self.path.split("?", 1)[1].split("&"):
+                if pair.startswith("key=") and pair[4:] in keys:
+                    return True
+        return False
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -454,7 +465,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path.startswith("/v1/") and not self._authorized():
+            if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             if self.path == "/v1/models":
@@ -477,7 +488,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if self.path.startswith("/v1/") and not self._authorized():
+            if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             length = int(self.headers.get("Content-Length", 0))
