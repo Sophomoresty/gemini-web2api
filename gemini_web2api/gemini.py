@@ -147,13 +147,13 @@ def _get_url() -> str:
     )
 
 
-def clean_text(text: str) -> str:
+def clean_text(text: str, strip: bool = True) -> str:
     text = re.sub(
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL
     )
     text = re.sub(r'http://googleusercontent\.com/card_content/\d+\n?', '', text)
-    return text.strip()
+    return text.strip() if strip else text
 
 
 def _extract_texts_from_line(line: str) -> list:
@@ -181,6 +181,9 @@ def _extract_texts_from_line(line: str) -> list:
 
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
+    bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
+    if bard_err:
+        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
@@ -233,21 +236,31 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     client = _get_httpx_client()
 
     last_err = None
+    emitted_raw_text = ""
     for attempt in range(CONFIG["retry_attempts"]):
         try:
-            prev_text = ""
             with client.stream("POST", url, content=body, headers=headers) as resp:
+                resp.raise_for_status()
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
+                    if "BardErrorInfo" in buf:
+                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                        if bard_err:
+                            raise RuntimeError(
+                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
+                            )
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
-                            if len(t) > len(prev_text):
-                                delta = clean_text(t[len(prev_text):])
-                                if delta:
-                                    yield delta
-                                prev_text = t
+                            if t == emitted_raw_text or emitted_raw_text.startswith(t):
+                                continue
+                            if not t.startswith(emitted_raw_text):
+                                raise RuntimeError("Gemini stream content changed during retry")
+                            delta = clean_text(t[len(emitted_raw_text):], strip=False)
+                            emitted_raw_text = t
+                            if delta:
+                                yield delta
             return
         except Exception as e:
             last_err = e

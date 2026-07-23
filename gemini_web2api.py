@@ -51,10 +51,10 @@ DEFAULT_CONFIG = {
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
-    "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
+    "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.5-flash",
+    "default_model": "gemini-3.6-flash",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
@@ -280,6 +280,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
         with client.stream("POST", url, content=body, headers=headers) as resp:
+            resp.raise_for_status()
             buf = ""
             for chunk in resp.iter_text():
                 buf += chunk
@@ -304,7 +305,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
                                     for t in part[1]:
                                         if isinstance(t, str) and len(t) > len(prev_text):
                                             delta = t[len(prev_text):]
-                                            delta = clean_gemini_text(delta)
+                                            delta = clean_gemini_text(delta, strip=False)
                                             if delta:
                                                 yield delta
                                             prev_text = t
@@ -312,13 +313,13 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
                         pass
 
 
-def clean_gemini_text(text: str) -> str:
+def clean_gemini_text(text: str, strip: bool = True) -> str:
     """Remove internal code execution artifacts."""
     text = re.sub(
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL
     )
-    return text.strip()
+    return text.strip() if strip else text
 
 
 def extract_response_text(raw: str) -> str:
