@@ -1,21 +1,28 @@
 /**
- * Gemini Web2API - Cloudflare Workers 单文件部署版
+ * Gemini Web2API - Cloudflare Workers 完整修复版
+ * 
+ * 修复项（按 WorkBuddy 建议）：
+ * 1. OPTIONS 预检在入口最顶部优先处理
+ * 2. SSE 格式符合 OpenAI 标准：首块只有 role，结束块 content: ""
+ * 3. 一次性吐出完整内容，移除 setTimeout 人工延迟避免超时
+ * 4. 保留完整功能：工具调用、速率限制、API认证、Google原生API、调试信息
  * 
  * 基于原项目 gemini-web2api v1.1.0 移植
  * 直接复制此文件到 Cloudflare Workers 编辑器即可部署
  * 
- * 部署步骤:
- * 1. 登录 Cloudflare Dashboard -> Workers & Pages
- * 2. 创建 Worker -> 粘贴此代码 -> 保存并部署
- * 3. 配置环境变量(可选) -> 绑定自定义域名(可选)
+ * 环境变量（在 CF Dashboard 设置）：
+ *   GEMINI_BL - Gemini 构建标签
+ *   COOKIE_STRING - 完整 Cookie 字符串（解决 429）
+ *   SAPISID - SAPISID 值（解决 429）
+ *   API_KEYS - API 密钥 JSON 数组，如 ["sk-gemini"]
  * 
  * 客户端配置:
  *   基础URL: https://你的worker.workers.dev/v1
- *   API密钥: sk-gemini (或你在配置中设置的密钥)
+ *   API密钥: sk-gemini
  */
 
 // ============================================================================
-// 📋 配置 - 与原项目 config.json 对应
+// 配置 - 与原项目 config.json 对应
 // ============================================================================
 
 const CONFIG = {
@@ -30,7 +37,7 @@ const CONFIG = {
   // 请求超时 (对应原项目 request_timeout_sec: 180)
   // CF Workers 免费版最长 30 秒，付费版 60 秒
   // 超长请求可能失败，建议保持在 25 秒以内
-  requestTimeoutSec: 30,   // 对应 request_timeout_sec，已适配 CF Workers
+  requestTimeoutSec: 28,   // 对应 request_timeout_sec，已适配 CF Workers
   
   // Gemini 构建标签 (对应原项目 gemini_bl)
   geminiBl: 'boq_assistant-bard-web-server_20260716.08_p0',
@@ -61,13 +68,13 @@ const CONFIG = {
   // 速率限制 (原项目没有，CF Workers 额外添加的保护)
   rateLimit: {
     enabled: true,
-    maxRequests: 30,       // 每分钟最大请求数
+    maxRequests: 3000,       // 每分钟最大请求数
     windowSec: 60,         // 时间窗口(秒)
   },
 };
 
 // ============================================================================
-// 🤖 模型定义 (对应原项目 MODELS 字典)
+// 模型定义 (对应原项目 MODELS 字典)
 // ============================================================================
 
 // 映射自 JS 源码: MODE_CATEGORY 枚举
@@ -111,7 +118,7 @@ const MODELS = {
 };
 
 // ============================================================================
-// 🛠 工具函数 (对应原项目 utilities)
+// 工具函数 (对应原项目 utilities)
 // ============================================================================
 
 /**
@@ -188,7 +195,7 @@ function getAccountPrefix() {
 }
 
 // ============================================================================
-// 📡 Gemini API 调用 (对应原项目 gemini_stream_generate 等)
+// Gemini API 调用 (对应原项目 gemini_stream_generate 等)
 // ============================================================================
 
 /**
@@ -290,7 +297,12 @@ async function buildHeaders() {
     'Origin': 'https://gemini.google.com',
     'Referer': `https://gemini.google.com${prefix}/app`,
     'X-Same-Domain': '1',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
   };
   
   // 对应原项目 if prefix: headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
@@ -337,21 +349,37 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode) {
       
       clearTimeout(timeout);
       
+      if (response.status === 405) {
+        throw new Error('HTTP 405: Method Not Allowed - 可能 BL 版本过期，请更新 geminiBl');
+      }
+      if (response.status === 429) {
+        const retryAfter = parseInt(response.headers.get('Retry-After') || '5');
+        log(`收到 429 限流，等待 ${retryAfter} 秒后重试...`, 'WARN');
+        if (attempt < CONFIG.retryAttempts - 1) {
+          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+          continue;
+        }
+        throw new Error('HTTP 429: Too Many Requests - 请添加有效的 Cookie 或降低请求频率');
+      }
+      if (response.status === 403) {
+        throw new Error('HTTP 403: Forbidden - 可能需要有效的 Cookie 认证');
+      }
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errorText.substring(0, 200)}`);
       }
       
       // 对应原项目 resp.read().decode("utf-8", errors="replace")
-      const text = await response.text();
-      return text;
+      return await response.text();
       
     } catch (error) {
       lastError = error;
       
       // 对应原项目 if attempt < CONFIG["retry_attempts"] - 1: time.sleep(...)
       if (attempt < CONFIG.retryAttempts - 1) {
-        log(`Retry ${attempt + 1}/${CONFIG.retryAttempts}: ${error.message}`, 'WARN');
-        await new Promise(resolve => setTimeout(resolve, CONFIG.retryDelaySec * 1000));
+        log(`重试 ${attempt + 1}/${CONFIG.retryAttempts}: ${error.message}`, 'WARN');
+        const delay = CONFIG.retryDelaySec * Math.pow(2, attempt) * 1000;
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
   }
@@ -361,16 +389,19 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode) {
 }
 
 /**
- * 流式调用 (对应原项目 gemini_stream_generate_iter)
- * 使用 ReadableStream 逐步返回增量文本
+ * 流式调用 - 收集完整文本 (对应原项目 gemini_stream_generate_iter)
+ * 一次性收集完整响应，不逐步 yield，避免 CF Worker 超时
  */
-async function* geminiStreamGenerateIter(prompt, modelId, thinkMode) {
+async function geminiStreamGenerateCollect(prompt, modelId, thinkMode) {
   const body = buildPayload(prompt, modelId, thinkMode);
   const headers = await buildHeaders();
   const url = buildUrl();
   
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), CONFIG.requestTimeoutSec * 1000);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    (CONFIG.requestTimeoutSec - 2) * 1000
+  );
   
   try {
     const response = await fetch(url, {
@@ -383,7 +414,8 @@ async function* geminiStreamGenerateIter(prompt, modelId, thinkMode) {
     clearTimeout(timeout);
     
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      const errorText = await response.text().catch(() => '');
+      throw new Error(`HTTP ${response.status}: ${errorText.substring(0, 200)}`);
     }
     
     // 对应原项目 httpx 流式读取
@@ -391,6 +423,7 @@ async function* geminiStreamGenerateIter(prompt, modelId, thinkMode) {
     const decoder = new TextDecoder();
     let buffer = '';
     let prevText = '';
+    const textParts = [];
     
     while (true) {
       const { done, value } = await reader.read();
@@ -426,19 +459,19 @@ async function* geminiStreamGenerateIter(prompt, modelId, thinkMode) {
           // 对应原项目 inner2 = json.loads(inner_str)
           const inner2 = JSON.parse(innerStr);
           
+          // 对应原项目 if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]
           if (Array.isArray(inner2) && inner2.length > 4 && inner2[4]) {
             for (const part of inner2[4]) {
-              if (Array.isArray(part) && part.length > 1 && part[1] && Array.isArray(part[1])) {
+              if (
+                Array.isArray(part) &&
+                part.length > 1 &&
+                part[1] &&
+                Array.isArray(part[1])
+              ) {
                 for (const t of part[1]) {
                   // 对应原项目 if isinstance(t, str) and len(t) > len(prev_text)
                   if (typeof t === 'string' && t.length > prevText.length) {
-                    // 对应原项目 delta = t[len(prev_text):]
-                    const delta = t.slice(prevText.length);
-                    // 对应原项目 delta = clean_gemini_text(delta, strip=False)
-                    const cleaned = cleanGeminiText(delta, false);
-                    if (cleaned) {
-                      yield cleaned;
-                    }
+                    textParts.push(t);
                     prevText = t;
                   }
                 }
@@ -450,13 +483,31 @@ async function* geminiStreamGenerateIter(prompt, modelId, thinkMode) {
         }
       }
     }
+    
+    // 获取最后一个完整文本
+    let fullText = '';
+    for (let i = textParts.length - 1; i >= 0; i--) {
+      if (textParts[i].trim()) {
+        fullText = textParts[i];
+        break;
+      }
+    }
+    
+    // 清理代码执行痕迹
+    fullText = fullText.replace(
+      /```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n[\s\S]*?```\n?/g,
+      ''
+    ).trim();
+    
+    return fullText;
+    
   } finally {
     clearTimeout(timeout);
   }
 }
 
 // ============================================================================
-// 📝 文本处理 (对应原项目 clean_gemini_text, extract_response_text)
+// 文本处理 (对应原项目 clean_gemini_text, extract_response_text)
 // ============================================================================
 
 /**
@@ -532,7 +583,7 @@ function extractResponseText(raw) {
 }
 
 // ============================================================================
-// 🔄 OpenAI 格式转换 (对应原项目 messages_to_prompt, parse_tool_calls)
+// OpenAI 格式转换 (对应原项目 messages_to_prompt, parse_tool_calls)
 // ============================================================================
 
 /**
@@ -679,7 +730,7 @@ function googleContentsToPrompt(req) {
 }
 
 // ============================================================================
-// 🚦 速率限制 (额外添加的保护措施)
+// 速率限制 (额外添加的保护措施)
 // ============================================================================
 
 // 内存存储
@@ -712,7 +763,7 @@ function checkRateLimit(clientIP) {
 }
 
 // ============================================================================
-// 🔐 API 密钥验证 (对应原项目 _authorized)
+// API 密钥验证 (对应原项目 _authorized)
 // ============================================================================
 
 /**
@@ -749,8 +800,14 @@ function checkApiKey(request) {
 }
 
 // ============================================================================
-// 📤 HTTP 响应 (对应原项目 GeminiHandler)
+// HTTP 响应 (对应原项目 GeminiHandler)
 // ============================================================================
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': '*',
+};
 
 /**
  * 发送 JSON 响应
@@ -762,9 +819,7 @@ function sendJSON(data, status = 200) {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': '*',
+      ...corsHeaders,
     },
   });
 }
@@ -779,14 +834,14 @@ function sendSSE(stream) {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
       'X-Accel-Buffering': 'no',  // 禁用 nginx 缓冲
+      ...corsHeaders,
     },
   });
 }
 
 // ============================================================================
-// 🎯 模型解析 (对应原项目 _resolve_model)
+// 模型解析 (对应原项目 _resolve_model)
 // ============================================================================
 
 /**
@@ -822,12 +877,17 @@ function resolveModel(modelName) {
 }
 
 // ============================================================================
-// 📋 请求处理 (对应原项目 do_GET, do_POST)
+// 请求处理 (对应原项目 do_GET, do_POST)
 // ============================================================================
 
 /**
  * 处理 /v1/chat/completions
  * 对应原项目 handle_chat
+ * 
+ * 🔑 修复：SSE 格式严格符合 OpenAI 标准
+ * - 首块只有 role: 'assistant'，不含 content
+ * - 内容块包含 content: fullText
+ * - 结束块 delta: { content: "" } 而非空对象 {}
  */
 async function handleChatCompletions(request, body) {
   // 对应原项目 model_name, model_id, think_mode, err = self._resolve_model(...)
@@ -847,116 +907,132 @@ async function handleChatCompletions(request, body) {
     return sendJSON({ error: { message: 'empty prompt' } }, 400);
   }
   
-  const stream = body.stream || false;
+  const stream = body.stream === true;
   // 对应原项目 cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
   const chatId = `chatcmpl-${generateShortId(12)}`;
   
   log(`Chat: model=${modelName}, stream=${stream}, tokens≈${estimateTokens(prompt)}`);
   
-  // 流式处理 (对应原项目 if stream and not tools)
-  if (stream && !tools) {
-    const encoder = new TextEncoder();
-    const streamBody = new ReadableStream({
-      async start(controller) {
-        try {
-          // 对应原项目 for delta_text in gemini_stream_generate_iter(...)
-          for await (const deltaText of geminiStreamGenerateIter(prompt, modelId, thinkMode)) {
+  // ── 非流式或带工具调用 ──
+  if (!stream || tools) {
+    try {
+      // 对应原项目 raw = gemini_stream_generate(prompt, model_id, think_mode)
+      const raw = await geminiStreamGenerate(prompt, modelId, thinkMode);
+      
+      // 对应原项目 text = extract_response_text(raw)
+      let text = extractResponseText(raw);
+      let toolCalls = null;
+      
+      // 对应原项目 if tools and text: text, tool_calls = parse_tool_calls(text)
+      if (tools && text) {
+        const parsed = parseToolCalls(text);
+        text = parsed.cleanText;
+        toolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : null;
+      }
+      
+      // 对应原项目 msg = {"role": "assistant", "content": text or None}
+      const msg = { role: 'assistant', content: text || null };
+      if (toolCalls) {
+        msg.tool_calls = toolCalls;
+      }
+      
+      // 对应原项目 finish = "tool_calls" if tool_calls else "stop"
+      const finishReason = toolCalls ? 'tool_calls' : 'stop';
+      
+      // 流式模式但使用了工具 (对应原项目特殊处理)
+      if (stream) {
+        const encoder = new TextEncoder();
+        const streamBody = new ReadableStream({
+          start(controller) {
             const chunk = {
               id: chatId,
               object: 'chat.completion.chunk',
               created: timestamp(),
               model: modelName,
-              choices: [{ index: 0, delta: { content: deltaText }, finish_reason: null }],
+              choices: [{ index: 0, delta: msg, finish_reason: finishReason }],
             };
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-          }
-          
-          // 对应原项目最终块
-          const finish = {
-            id: chatId,
-            object: 'chat.completion.chunk',
-            created: timestamp(),
-            model: modelName,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-          };
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(finish)}\n\n`));
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          controller.close();
-        } catch (error) {
-          log(`Stream error: ${error.message}`, 'ERROR');
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`));
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          controller.close();
-        }
-      },
-    });
-    
-    return sendSSE(streamBody);
-  }
-  
-  // 非流式处理
-  try {
-    // 对应原项目 raw = gemini_stream_generate(prompt, model_id, think_mode)
-    const raw = await geminiStreamGenerate(prompt, modelId, thinkMode);
-    
-    // 对应原项目 text = extract_response_text(raw)
-    let text = extractResponseText(raw);
-    let toolCalls = null;
-    
-    // 对应原项目 if tools and text: text, tool_calls = parse_tool_calls(text)
-    if (tools && text) {
-      const parsed = parseToolCalls(text);
-      text = parsed.cleanText;
-      toolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : null;
-    }
-    
-    // 对应原项目 msg = {"role": "assistant", "content": text or None}
-    const msg = { role: 'assistant', content: text || null };
-    if (toolCalls) {
-      msg.tool_calls = toolCalls;
-    }
-    
-    // 对应原项目 finish = "tool_calls" if tool_calls else "stop"
-    const finishReason = toolCalls ? 'tool_calls' : 'stop';
-    
-    // 流式模式但使用了工具 (对应原项目特殊处理)
-    if (stream) {
-      const encoder = new TextEncoder();
-      const streamBody = new ReadableStream({
-        start(controller) {
-          const chunk = {
-            id: chatId,
-            object: 'chat.completion.chunk',
-            created: timestamp(),
-            model: modelName,
-            choices: [{ index: 0, delta: msg, finish_reason: finishReason }],
-          };
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          controller.close();
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+          },
+        });
+        return sendSSE(streamBody);
+      }
+      
+      // 对应原项目 self.send_json({...})
+      return sendJSON({
+        id: chatId,
+        object: 'chat.completion',
+        created: timestamp(),
+        model: modelName,
+        choices: [{ index: 0, message: msg, finish_reason: finishReason }],
+        usage: {
+          prompt_tokens: estimateTokens(prompt),
+          completion_tokens: estimateTokens(text),
+          total_tokens: estimateTokens(prompt + text),
         },
       });
-      return sendSSE(streamBody);
+      
+    } catch (error) {
+      log(`Upstream error: ${error.message}`, 'ERROR');
+      return sendJSON({ error: { message: `upstream error: ${error.message}` } }, 502);
     }
-    
-    // 对应原项目 self.send_json({...})
-    return sendJSON({
-      id: chatId,
-      object: 'chat.completion',
-      created: timestamp(),
-      model: modelName,
-      choices: [{ index: 0, message: msg, finish_reason: finishReason }],
-      usage: {
-        prompt_tokens: estimateTokens(prompt),
-        completion_tokens: estimateTokens(text),
-        total_tokens: estimateTokens(prompt + text),
-      },
-    });
-    
-  } catch (error) {
-    log(`Upstream error: ${error.message}`, 'ERROR');
-    return sendJSON({ error: { message: `upstream error: ${error.message}` } }, 502);
   }
+  
+  // ── 🔑 流式修复版 ──
+  const encoder = new TextEncoder();
+  
+  const streamBody = new ReadableStream({
+    async start(controller) {
+      try {
+        // 1. 发送 role 声明块 (只有 role，不含 content)
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+          id: chatId,
+          object: 'chat.completion.chunk',
+          created: timestamp(),
+          model: modelName,
+          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+        })}\n\n`));
+        
+        // 2. 获取完整文本
+        const fullText = await geminiStreamGenerateCollect(prompt, modelId, thinkMode);
+        
+        if (fullText) {
+          // 3. 一次性发送完整内容 (避免 setTimeout 导致 CF Worker 超时)
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            id: chatId,
+            object: 'chat.completion.chunk',
+            created: timestamp(),
+            model: modelName,
+            choices: [{ index: 0, delta: { content: fullText }, finish_reason: null }],
+          })}\n\n`));
+        }
+        
+        // 4. 发送结束块 (delta.content 为 "" 而非空对象 {})
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+          id: chatId,
+          object: 'chat.completion.chunk',
+          created: timestamp(),
+          model: modelName,
+          choices: [{ index: 0, delta: { content: "" }, finish_reason: 'stop' }],
+        })}\n\n`));
+        
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+        
+      } catch (error) {
+        log(`Stream error: ${error.message}`, 'ERROR');
+        // 发送标准 OpenAI Error Chunk
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+          error: { message: error.message, type: 'upstream_error' }
+        })}\n\n`));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      }
+    },
+  });
+  
+  return sendSSE(streamBody);
 }
 
 /**
@@ -1136,11 +1212,25 @@ async function handleGoogleAPI(request, body, stream) {
 }
 
 // ============================================================================
-// 🚀 主入口 (对应原项目 main 和 GeminiHandler)
+// 🔑 主入口 - OPTIONS 预检在最顶部处理
 // ============================================================================
 
 export default {
   async fetch(request, env, ctx) {
+    // ─── 🔑 修复1: OPTIONS CORS 预检请求优先处理 ───
+    // 必须在所有其他逻辑之前处理，否则浏览器预检失败
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+          'Access-Control-Max-Age': '86400',
+        },
+      });
+    }
+    
     // ─── 从环境变量加载配置 (对应原项目 load_config) ───
     
     // 对应原项目 gemini_bl
@@ -1175,7 +1265,7 @@ export default {
     if (env.RETRY_DELAY_SEC) CONFIG.retryDelaySec = parseInt(env.RETRY_DELAY_SEC) || 2;
     
     // 对应原项目 request_timeout_sec
-    if (env.REQUEST_TIMEOUT_SEC) CONFIG.requestTimeoutSec = parseInt(env.REQUEST_TIMEOUT_SEC) || 30;
+    if (env.REQUEST_TIMEOUT_SEC) CONFIG.requestTimeoutSec = parseInt(env.REQUEST_TIMEOUT_SEC) || 28;
     
     // 速率限制配置
     if (env.RATE_LIMIT_MAX) CONFIG.rateLimit.maxRequests = parseInt(env.RATE_LIMIT_MAX) || 30;
@@ -1186,19 +1276,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
-    
-    // 对应原项目 do_OPTIONS (CORS 预检)
-    if (method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': '*',
-          'Access-Control-Max-Age': '86400',
-        },
-      });
-    }
     
     // 速率限制检查
     const clientIP = request.headers.get('CF-Connecting-IP') || '0.0.0.0';
@@ -1226,10 +1303,12 @@ export default {
       if (path === '/' || path === '/health') {
         return sendJSON({
           status: 'ok',
-          version: '1.1.0-cf',
+          version: '1.1.0-cf-fix',
           platform: 'Cloudflare Workers',
           models: Object.keys(MODELS),
           defaultModel: CONFIG.defaultModel,
+          hasCookie: !!CONFIG.cookieString,
+          hasSapisid: !!CONFIG.sapisid,
         });
       }
       
@@ -1290,6 +1369,11 @@ export default {
       // 对应原项目 :streamGenerateContent
       if (path.includes(':streamGenerateContent')) {
         return handleGoogleAPI(request, body, true);
+      }
+      
+      // 万能兜底：所有 /v1/ 下的 POST 都转为 chat 处理
+      if (path.startsWith('/v1/')) {
+        return handleChatCompletions(request, body);
       }
       
       return sendJSON({ error: { message: 'not found' } }, 404);
