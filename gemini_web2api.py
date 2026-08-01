@@ -59,6 +59,7 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
+    "temporary_chats": False,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -144,6 +145,16 @@ def account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
+def apply_chat_persistence_flags(inner: list) -> None:
+    """Apply Gemini Web persistence flags to an outgoing request payload."""
+    if CONFIG.get("temporary_chats", False):
+        # Match Gemini Web temporary-chat requests.
+        inner[41] = [1]
+        inner[45] = 1
+    else:
+        inner[41] = [2]
+
+
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
 def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
@@ -160,7 +171,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
     inner[18] = 0
     inner[27] = 1
     inner[30] = [4]
-    inner[41] = [2]
+    apply_chat_persistence_flags(inner)
     inner[53] = 0
     inner[59] = str(uuid.uuid4())
     inner[61] = []
@@ -232,7 +243,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
     inner[18] = 0
     inner[27] = 1
     inner[30] = [4]
-    inner[41] = [2]
+    apply_chat_persistence_flags(inner)
     inner[53] = 0
     inner[59] = str(uuid.uuid4())
     inner[61] = []
@@ -870,6 +881,7 @@ def main():
     print(f"  Cookie:    {'yes (' + CONFIG['cookie_file'] + ')' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'none (uses system env HTTP_PROXY/HTTPS_PROXY)'}")
     print(f"  Retry:     {CONFIG['retry_attempts']}x / {CONFIG['retry_delay_sec']}s")
+    print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
     print()
     try:
         server.serve_forever()
