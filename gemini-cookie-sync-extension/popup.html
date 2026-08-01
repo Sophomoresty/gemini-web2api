@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gemini Cookie Sync</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      width: 390px;
+      margin: 0;
+      padding: 16px;
+      background: Canvas;
+      color: CanvasText;
+    }
+    h1 { font-size: 17px; margin: 0 0 8px; }
+    p { font-size: 13px; line-height: 1.55; margin: 8px 0; }
+    button {
+      width: 100%;
+      padding: 10px 12px;
+      margin-top: 10px;
+      border: 0;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:disabled { opacity: .55; cursor: wait; }
+    #export { background: #1769e0; color: white; }
+    #inspect, #open { background: color-mix(in srgb, CanvasText 10%, Canvas); color: CanvasText; }
+    #status {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      border-radius: 8px;
+      padding: 10px;
+      background: color-mix(in srgb, CanvasText 7%, Canvas);
+      min-height: 44px;
+      max-height: 240px;
+      overflow-y: auto;
+    }
+    .warn { color: #b34800; }
+    .ok { color: #17823b; }
+    code { direction: ltr; unicode-bidi: embed; }
+    .note { opacity: .78; }
+  </style>
+</head>
+<body>
+  <h1>Gemini Cookie Sync</h1>
+  <p>Exports cookies, XSRF, and build metadata from the current Gemini session to <code>gemini-auth.json</code>. Nothing is sent over the network.</p>
+  <button id="open" type="button">Open Gemini</button>
+  <button id="inspect" type="button">Inspect session</button>
+  <button id="export" type="button">Export gemini-auth.json</button>
+  <p id="status">Ready.</p>
+  <p class="note">Open Gemini, sign in, then refresh the page before inspection. The generated file contains highly sensitive session data; do not share it or commit it to Git.</p>
+  <script src="popup.js"></script>
+</body>
+</html>
