@@ -1,7 +1,7 @@
-# gemini-web2api
+# OmniAI
 
 <p align="center">
-  <img src="logo.png" width="200" alt="gemini-web2api logo">
+  <img src="logo.png" width="200" alt="OmniAI logo">
 </p>
 
 [中文文档](README_CN.md)
@@ -184,8 +184,8 @@ When `api_keys` is `[]`, authentication is disabled. When one or more keys are s
 
 ```bash
 cp config.example.json config.json
-docker build -t gemini-web2api .
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json gemini-web2api
+docker build -t omniai .
+docker run -d --name omniai -p 8081:8081 -v ./config.json:/app/config.json omniai
 ```
 
 Or use Docker Compose:
@@ -198,7 +198,7 @@ docker compose up -d
 To mount a cookie file:
 
 ```bash
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
+docker run -d --name omniai -p 8081:8081 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt omniai
 ```
 
 Set `"cookie_file": "/app/cookie.txt"` in `config.json`.

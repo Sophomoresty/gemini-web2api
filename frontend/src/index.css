@@ -1,0 +1,181 @@
+@import "tailwindcss";
+@import "katex/dist/katex.min.css";
+
+@theme {
+  --color-primary: #2563EB;
+  --color-secondary: #3B82F6;
+  --color-accent: #60A5FA;
+  --color-success: #22C55E;
+  --color-warning: #F59E0B;
+  --color-danger: #EF4444;
+
+  --color-dark-bg: #09090B;
+  --color-surface: #111827;
+  --color-card: #18181B;
+
+  --font-sans: "Inter", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+@layer base {
+  :root {
+    --background: #ffffff;
+    --foreground: #0a0a0a;
+    --surface: #f3f4f6;
+    --card: #ffffff;
+    --border: rgba(0, 0, 0, 0.08);
+  }
+
+  .dark {
+    --background: #09090B;
+    --foreground: #ffffff;
+    --surface: #111827;
+    --card: #18181B;
+    --border: rgba(255, 255, 255, 0.08);
+  }
+
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+  }
+
+  * {
+    border-color: var(--border);
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  ::selection {
+    background-color: rgba(37, 99, 235, 0.3);
+    color: inherit;
+  }
+
+  button {
+    font-family: inherit;
+  }
+
+  textarea, input, select {
+    font-family: inherit;
+  }
+
+  input[type="range"] {
+    height: 4px;
+    border-radius: 999px;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #2563EB;
+    cursor: pointer;
+    border: 2px solid white;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #2563EB;
+    cursor: pointer;
+    border: 2px solid white;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+  }
+
+  .dark input[type="range"] {
+    background: rgba(255,255,255,0.1);
+  }
+  :root:not(.dark) input[type="range"] {
+    background: rgba(0,0,0,0.08);
+  }
+
+  select {
+    -webkit-appearance: none;
+    appearance: none;
+    background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+    background-repeat: no-repeat;
+    background-position: right 0.75rem center;
+    background-size: 1em;
+    padding-right: 2.5rem;
+  }
+}
+
+@layer utilities {
+  .glass {
+    background-color: color-mix(in oklab, var(--card) 70%, transparent);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--border);
+  }
+
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+  }
+
+  /* Better prose defaults for markdown in light mode */
+  :root:not(.dark) .prose-invert :is(h1,h2,h3,h4,h5,h6,p,li,blockquote,th,td,strong) {
+    color: inherit;
+  }
+  :root:not(.dark) pre { background: #0d0d12 !important; }
+
+  .animate-in {
+    animation-duration: 200ms;
+    animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+    animation-fill-mode: both;
+    animation-name: fadeIn;
+  }
+  .animate-out {
+    animation-duration: 200ms;
+    animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+    animation-fill-mode: both;
+    animation-name: fadeOut;
+  }
+  .fade-in { animation-name: fadeIn; }
+  .fade-out { animation-name: fadeOut; }
+  .zoom-in-95 { animation-name: zoomIn95; }
+  .zoom-in-95.fade-in { animation-name: fadeIn, zoomIn95; }
+  .slide-in-from-top-2 { animation-name: slideFromTop2; }
+  .slide-in-from-top-1 { animation-name: slideFromTop1; }
+  .slide-in-from-bottom-2 { animation-name: slideFromBottom2; }
+  .slide-in-from-right { animation-name: slideFromRight; }
+  .slide-in-from-left { animation-name: slideFromLeft; }
+  .slide-out-to-right { animation-name: slideOutRight; }
+
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
+  @keyframes zoomIn95 { from { transform: scale(0.96); } to { transform: scale(1); } }
+  @keyframes slideFromTop2 { from { transform: translateY(-8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  @keyframes slideFromTop1 { from { transform: translateY(-4px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  @keyframes slideFromBottom2 { from { transform: translateY(8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  @keyframes slideFromRight { from { transform: translateX(20px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+  @keyframes slideFromLeft { from { transform: translateX(-100%); } to { transform: translateX(0); } }
+  @keyframes slideOutRight { from { transform: translateX(0); opacity: 1; } to { transform: translateX(20px); opacity: 0; } }
+}
