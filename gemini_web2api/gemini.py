@@ -104,6 +104,16 @@ def _build_headers() -> dict:
     return headers
 
 
+def _apply_chat_persistence_flags(inner: list) -> None:
+    """Apply Gemini Web persistence flags to an outgoing request payload."""
+    if CONFIG.get("temporary_chats", False):
+        # Match Gemini Web temporary-chat requests.
+        inner[41] = [1]
+        inner[45] = 1
+    else:
+        inner[41] = [2]
+
+
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     inner = [None] * 102
     if file_refs:
@@ -121,7 +131,7 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[18] = 0
     inner[27] = 1
     inner[30] = [4]
-    inner[41] = [2]
+    _apply_chat_persistence_flags(inner)
     inner[53] = 0
     inner[59] = str(uuid.uuid4())
     inner[61] = []

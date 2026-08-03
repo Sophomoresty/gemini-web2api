@@ -169,6 +169,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream and (not tools or tool_choice == "none"):
             try:
                 self._start_sse()
+                first_chunk = {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "finish_reason": None,
+                    }],
+                }
+                self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
+                self.wfile.flush()
                 for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
@@ -296,24 +309,139 @@ class GeminiHandler(BaseHTTPRequestHandler):
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
 
         if req.get("stream"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
-            self.wfile.write(f"event: response.created\ndata: {json.dumps(ev)}\n\n".encode())
-            for item in output:
+            self._start_sse()
+            sequence_number = 0
+
+            def emit(event_type, **fields):
+                nonlocal sequence_number
+                sequence_number += 1
+                event = {
+                    "type": event_type,
+                    "sequence_number": sequence_number,
+                    **fields,
+                }
+                self.wfile.write(
+                    f"event: {event_type}\ndata: {json.dumps(event)}\n\n".encode()
+                )
+
+            usage = {
+                "input_tokens": len(prompt) // 4,
+                "output_tokens": len(text or "") // 4,
+                "total_tokens": (len(prompt) + len(text or "")) // 4,
+            }
+            base_response = {
+                "id": rid,
+                "object": "response",
+                "created_at": int(time.time()),
+                "model": model_name,
+            }
+            emit(
+                "response.created",
+                response={
+                    **base_response,
+                    "status": "in_progress",
+                    "output": [],
+                    "usage": None,
+                },
+            )
+            emit(
+                "response.in_progress",
+                response={
+                    **base_response,
+                    "status": "in_progress",
+                    "output": [],
+                    "usage": None,
+                },
+            )
+            for output_index, item in enumerate(output):
                 if item["type"] == "function_call":
-                    ev = {"type": "response.function_call_arguments.done", "item_id": item["id"], "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}
-                    self.wfile.write(f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n".encode())
+                    pending_item = {
+                        "type": "function_call",
+                        "id": item["id"],
+                        "call_id": item["call_id"],
+                        "name": item["name"],
+                        "arguments": "",
+                        "status": "in_progress",
+                    }
+                    emit(
+                        "response.output_item.added",
+                        output_index=output_index,
+                        item=pending_item,
+                    )
+                    emit(
+                        "response.function_call_arguments.delta",
+                        item_id=item["id"],
+                        output_index=output_index,
+                        delta=item["arguments"],
+                    )
+                    emit(
+                        "response.function_call_arguments.done",
+                        item_id=item["id"],
+                        output_index=output_index,
+                        arguments=item["arguments"],
+                    )
+                    emit(
+                        "response.output_item.done",
+                        output_index=output_index,
+                        item=item,
+                    )
                 elif item["type"] == "message":
-                    for ci, cp in enumerate(item["content"]):
-                        ev = {"type": "response.output_text.done", "item_id": item["id"], "content_index": ci, "text": cp["text"]}
-                        self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
-            resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
-                        "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}}
-            self.wfile.write(f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n".encode())
+                    pending_item = {
+                        "type": "message",
+                        "id": item["id"],
+                        "role": "assistant",
+                        "status": "in_progress",
+                        "content": [],
+                    }
+                    emit(
+                        "response.output_item.added",
+                        output_index=output_index,
+                        item=pending_item,
+                    )
+                    for content_index, content_part in enumerate(item["content"]):
+                        event_fields = {
+                            "item_id": item["id"],
+                            "output_index": output_index,
+                            "content_index": content_index,
+                        }
+                        emit(
+                            "response.content_part.added",
+                            **event_fields,
+                            part={
+                                "type": "output_text",
+                                "text": "",
+                                "annotations": [],
+                            },
+                        )
+                        emit(
+                            "response.output_text.delta",
+                            **event_fields,
+                            delta=content_part["text"],
+                        )
+                        emit(
+                            "response.output_text.done",
+                            **event_fields,
+                            text=content_part["text"],
+                        )
+                        emit(
+                            "response.content_part.done",
+                            **event_fields,
+                            part=content_part,
+                        )
+                    emit(
+                        "response.output_item.done",
+                        output_index=output_index,
+                        item=item,
+                    )
+            emit(
+                "response.completed",
+                response={
+                    **base_response,
+                    "status": "completed",
+                    "output": output,
+                    "usage": usage,
+                },
+            )
             self.wfile.flush()
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
