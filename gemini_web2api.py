@@ -32,6 +32,8 @@ import os
 import hashlib
 import argparse
 import base64
+import binascii
+from typing import Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -154,7 +156,7 @@ def apply_chat_persistence_flags(inner: list) -> None:
         inner[41] = [2]
 
 
-def fetch_latest_bl() -> str | None:
+def fetch_latest_bl() -> Optional[str]:
     """Fetch the latest gemini_bl from gemini.google.com page."""
     try:
         req = urllib.request.Request(
@@ -188,12 +190,40 @@ def update_bl_if_needed() -> bool:
     return False
 
 
+def upload_images(images: list) -> list:
+    """Upload parsed OpenAI image parts and return Gemini file references."""
+    if not images:
+        return None
+    from gemini_web2api.multimodal import detect_image_mime, fetch_image_bytes, upload_image
+
+    file_refs = []
+    for item in images:
+        if not (isinstance(item, tuple) and len(item) == 2):
+            continue
+        data, mime = item
+        if isinstance(data, str):
+            data = fetch_image_bytes(data)
+            mime = mime or "image/png"
+        if not data:
+            raise RuntimeError("image fetch failed")
+        mime = detect_image_mime(data, mime or "image/png")
+        try:
+            file_refs.append(upload_image(data, "image.png", mime or "image/png"))
+        except Exception as e:
+            raise RuntimeError(f"image upload failed: {e}") from e
+    return file_refs if file_refs else None
+
+
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
-def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
+def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
     """Send prompt to Gemini StreamGenerate with retry."""
     inner = [None] * 80
-    inner[0] = [prompt, 0, None, None, None, None, 0]
+    if file_refs:
+        refs = [[None, None, ref] for ref in file_refs]
+        inner[0] = [prompt, 0, None, refs, None, None, 0]
+    else:
+        inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
     inner[2] = ["", "", "", None, None, None, None, None, None, ""]
     inner[6] = [0]
@@ -277,10 +307,14 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
     raise last_err
 
 
-def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
+def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
     """Send prompt and yield incremental text deltas using httpx streaming."""
     inner = [None] * 80
-    inner[0] = [prompt, 0, None, None, None, None, 0]
+    if file_refs:
+        refs = [[None, None, ref] for ref in file_refs]
+        inner[0] = [prompt, 0, None, refs, None, None, 0]
+    else:
+        inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
     inner[2] = ["", "", "", None, None, None, None, None, None, ""]
     inner[6] = [0]
@@ -329,7 +363,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
 
     if not HAS_HTTPX:
         # Fallback: non-streaming with urllib
-        raw = gemini_stream_generate(prompt, model_id, think_mode)
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
         text = extract_response_text(raw)
         if text:
             yield text
@@ -375,7 +409,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
             if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 405:
                 if update_bl_if_needed():
                     log("BL updated, falling back to non-streaming for this request")
-                    raw = gemini_stream_generate(prompt, model_id, think_mode)
+                    raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
                     text = extract_response_text(raw)
                     if text:
                         yield text
@@ -429,9 +463,59 @@ def extract_response_text(raw: str) -> str:
 
 PROMPT_MAX_BYTES = 60000
 
-def messages_to_prompt(messages: list, tools: list = None) -> str:
-    """Convert OpenAI messages to prompt string."""
+
+def decode_data_url(url: str):
+    match = re.match(r"^data:([^;,]+)?(;base64)?,(.*)$", url, re.DOTALL)
+    if not match:
+        return None
+    mime = match.group(1) or "image/png"
+    is_base64 = bool(match.group(2))
+    data = match.group(3)
+    try:
+        if is_base64:
+            return base64.b64decode(data, validate=True), mime
+        return urllib.parse.unquote_to_bytes(data), mime
+    except (ValueError, TypeError, binascii.Error):
+        return None
+
+
+def image_from_url(url: str, mime: str = None):
+    if not isinstance(url, str) or not url:
+        return None
+    if url.startswith("data:"):
+        return decode_data_url(url)
+    return url, mime or "image/png"
+
+
+def image_from_part(part: dict):
+    part_type = part.get("type")
+    if part_type == "image_url":
+        image_url = part.get("image_url", {})
+        if isinstance(image_url, dict):
+            return image_from_url(image_url.get("url"), image_url.get("mime_type"))
+        return image_from_url(image_url)
+    if part_type in ("input_image", "image"):
+        image_url = part.get("image_url") or part.get("url")
+        if isinstance(image_url, dict):
+            return image_from_url(image_url.get("url"), image_url.get("mime_type"))
+        if image_url:
+            return image_from_url(image_url, part.get("mime_type"))
+        image_data = part.get("data") or part.get("base64")
+        if isinstance(image_data, str):
+            mime = part.get("mime_type") or part.get("media_type") or "image/png"
+            if image_data.startswith("data:"):
+                return decode_data_url(image_data)
+            try:
+                return base64.b64decode(image_data, validate=True), mime
+            except (ValueError, TypeError, binascii.Error):
+                return None
+    return None
+
+
+def messages_to_prompt(messages: list, tools: list = None) -> tuple:
+    """Convert OpenAI messages to (prompt_str, images_list)."""
     parts = []
+    images = []
     if tools:
         tool_defs = []
         for tool in tools:
@@ -458,10 +542,16 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
         role = msg.get("role", "user")
         content = msg.get("content", "")
         if isinstance(content, list):
-            content = " ".join(
-                c.get("text", "") for c in content
-                if c.get("type") in ("text", "input_text")
-            )
+            text_parts = []
+            for c in content:
+                if c.get("type") in ("text", "input_text", "output_text"):
+                    text_parts.append(c.get("text", ""))
+                else:
+                    image = image_from_part(c)
+                    if image:
+                        images.append(image)
+                        text_parts.append("[Image attached]")
+            content = " ".join(text_parts)
         if role == "system":
             parts.append(f"[System instruction]: {content}")
         elif role == "assistant":
@@ -480,7 +570,45 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
             parts.append(f"[Tool result for {msg.get('name', '')}]: {content}")
         else:
             parts.append(content if content else "")
-    return "\n\n".join(p for p in parts if p)
+    return "\n\n".join(p for p in parts if p), images
+
+
+def google_contents_to_prompt(req: dict) -> tuple:
+    """Convert Google API contents to (prompt_str, images_list)."""
+    parts = []
+    images = []
+
+    sys_inst = req.get("systemInstruction")
+    if sys_inst:
+        sys_text = " ".join(
+            part.get("text", "") for part in sys_inst.get("parts", []) if part.get("text")
+        )
+        if sys_text:
+            parts.append(f"[System instruction]: {sys_text}")
+
+    for content in req.get("contents", []):
+        role = content.get("role", "user")
+        text_parts = []
+        for part in content.get("parts", []):
+            if part.get("text"):
+                text_parts.append(part["text"])
+            elif part.get("inlineData"):
+                data = part["inlineData"]
+                try:
+                    images.append((
+                        base64.b64decode(data["data"], validate=True),
+                        data.get("mimeType", "image/png"),
+                    ))
+                    text_parts.append("[Image attached]")
+                except (KeyError, ValueError, TypeError, binascii.Error):
+                    pass
+        text = " ".join(text_parts)
+        if role == "model":
+            parts.append(f"[Assistant]: {text}")
+        else:
+            parts.append(text)
+
+    return "\n\n".join(part for part in parts if part), images
 
 
 def parse_tool_calls(text: str) -> tuple:
@@ -574,16 +702,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length) if length else b""
+            body = self._read_request_body()
             if self.path == "/v1/chat/completions":
                 self.handle_chat(body)
             elif self.path == "/v1/responses":
                 self.handle_responses(body)
-            elif ":generateContent" in self.path:
-                self._handle_google_generate(body, stream=False)
             elif ":streamGenerateContent" in self.path:
                 self._handle_google_generate(body, stream=True)
+            elif ":generateContent" in self.path:
+                self._handle_google_generate(body, stream=False)
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -595,6 +722,32 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except:
                 pass
 
+    def _read_request_body(self) -> bytes:
+        transfer_encoding = self.headers.get("Transfer-Encoding", "")
+        if "chunked" in transfer_encoding.lower():
+            chunks = []
+            while True:
+                size_line = self.rfile.readline()
+                if not size_line:
+                    break
+                size_text = size_line.split(b";", 1)[0].strip()
+                try:
+                    size = int(size_text, 16)
+                except ValueError:
+                    raise ValueError("invalid chunked request body")
+                if size == 0:
+                    while True:
+                        trailer = self.rfile.readline()
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2)
+            return b"".join(chunks)
+
+        length = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(length) if length else b""
+
     def _resolve_model(self, model_name):
         think_override = None
         if "@think=" in model_name:
@@ -605,8 +758,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return None, None, None, f"Unknown model: {model_name}"
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
-    def _call_gemini(self, prompt, model_id, think_mode, tools):
-        raw = gemini_stream_generate(prompt, model_id, think_mode)
+    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
@@ -622,13 +775,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tools = req.get("tools")
-        prompt = messages_to_prompt(req.get("messages", []), tools)
+        prompt, images = messages_to_prompt(req.get("messages", []), tools)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
 
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        try:
+            file_refs = upload_images(images)
+        except RuntimeError as e:
+            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            return
 
         if stream and not tools:
             # True streaming: forward chunks as they arrive
@@ -641,7 +799,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode):
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -660,7 +818,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         # Non-streaming (or tool calling which needs full response)
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -716,6 +874,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     if item.get("type") == "function_call_output":
                         messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
                                          "name": item.get("name", ""), "content": item.get("output", "")})
+                    elif item.get("type") in ("input_text", "input_image", "image"):
+                        messages.append({"role": "user", "content": [item]})
                     elif item.get("role") == "assistant" or (item.get("type") == "message" and item.get("role") == "assistant"):
                         cp = item.get("content", [])
                         text_acc, tc_list = "", []
@@ -734,22 +894,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         messages.append(m)
                     else:
                         role = item.get("role", "user")
-                        content = item.get("content", "")
-                        if isinstance(content, list):
-                            content = " ".join(c.get("text", "") for c in content if c.get("type") in ("text", "input_text"))
-                        messages.append({"role": role, "content": content})
+                        messages.append({"role": role, "content": item.get("content", "")})
 
         if tools:
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
 
-        prompt = messages_to_prompt(messages, tools)
+        prompt, images = messages_to_prompt(messages, tools)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
+            file_refs = upload_images(images)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -829,29 +987,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
             })
         self.send_json({"models": models})
 
-    def _google_contents_to_prompt(self, req: dict) -> str:
-        """Convert Google API contents format to prompt string."""
-        parts = []
-        sys_inst = req.get("systemInstruction")
-        if sys_inst:
-            sys_parts = sys_inst.get("parts", [])
-            sys_text = " ".join(p.get("text", "") for p in sys_parts if p.get("text"))
-            if sys_text:
-                parts.append(f"[System instruction]: {sys_text}")
-
-        for content in req.get("contents", []):
-            role = content.get("role", "user")
-            text_parts = []
-            for p in content.get("parts", []):
-                if p.get("text"):
-                    text_parts.append(p["text"])
-            text = " ".join(text_parts)
-            if role == "model":
-                parts.append(f"[Assistant]: {text}")
-            else:
-                parts.append(text)
-        return "\n\n".join(p for p in parts if p)
-
     def _handle_google_generate(self, body: bytes, stream: bool):
         """Handle Google native generateContent / streamGenerateContent."""
         req = json.loads(body)
@@ -865,13 +1000,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": err}}, 400)
             return
 
-        prompt = self._google_contents_to_prompt(req)
+        prompt, images = google_contents_to_prompt(req)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
 
         try:
-            text, _ = self._call_gemini(prompt, model_id, think_mode, None)
+            file_refs = upload_images(images)
+            text, _ = self._call_gemini(prompt, model_id, think_mode, None, file_refs)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
