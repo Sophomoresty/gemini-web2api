@@ -3,7 +3,9 @@ import json
 import re
 import uuid
 import base64
+import binascii
 import io
+from urllib.parse import unquote_to_bytes
 
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
 
@@ -51,6 +53,54 @@ def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
     return ""
 
 
+def _decode_data_url(url: str):
+    match = re.match(r"^data:([^;,]+)?(;base64)?,(.*)$", url, re.DOTALL)
+    if not match:
+        return None
+    mime = match.group(1) or "image/png"
+    is_base64 = bool(match.group(2))
+    data = match.group(3)
+    try:
+        if is_base64:
+            return base64.b64decode(data, validate=True), mime
+        return unquote_to_bytes(data), mime
+    except (ValueError, TypeError, binascii.Error):
+        return None
+
+
+def _image_from_url(url: str, mime: str = None):
+    if not isinstance(url, str) or not url:
+        return None
+    if url.startswith("data:"):
+        return _decode_data_url(url)
+    return url, mime or "image/png"
+
+
+def _image_from_part(part: dict):
+    part_type = part.get("type")
+    if part_type == "image_url":
+        image_url = part.get("image_url", {})
+        if isinstance(image_url, dict):
+            return _image_from_url(image_url.get("url"), image_url.get("mime_type"))
+        return _image_from_url(image_url)
+    if part_type in ("input_image", "image"):
+        image_url = part.get("image_url") or part.get("url")
+        if isinstance(image_url, dict):
+            return _image_from_url(image_url.get("url"), image_url.get("mime_type"))
+        if image_url:
+            return _image_from_url(image_url, part.get("mime_type"))
+        image_data = part.get("data") or part.get("base64")
+        if isinstance(image_data, str):
+            mime = part.get("mime_type") or part.get("media_type") or "image/png"
+            if image_data.startswith("data:"):
+                return _decode_data_url(image_data)
+            try:
+                return base64.b64decode(image_data, validate=True), mime
+            except (ValueError, TypeError, binascii.Error):
+                return None
+    return None
+
+
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 
@@ -88,10 +138,11 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             for c in content:
                 if c.get("type") in ("text", "input_text"):
                     text_parts.append(c.get("text", ""))
-                elif c.get("type") == "image_url":
-                    text_parts.append("[Note: Image input not supported in this API. Please describe the image in text.]")
-                elif c.get("type") == "image":
-                    text_parts.append("[Note: Image input not supported in this API. Please describe the image in text.]")
+                else:
+                    image = _image_from_part(c)
+                    if image:
+                        images.append(image)
+                        text_parts.append("[Image attached]")
             content = " ".join(text_parts)
 
         if role == "system":
@@ -226,8 +277,14 @@ def google_contents_to_prompt(req: dict) -> tuple:
                 msg_parts.append(p["text"])
             elif p.get("inlineData"):
                 data = p["inlineData"]
-                mime = data.get("mimeType", "image/png")
-                images.append((base64.b64decode(data["data"]), mime))
+                try:
+                    images.append((
+                        base64.b64decode(data["data"], validate=True),
+                        data.get("mimeType", "image/png"),
+                    ))
+                    msg_parts.append("[Image attached]")
+                except (KeyError, ValueError, TypeError, binascii.Error):
+                    pass
             elif p.get("functionCall"):
                 fc = p["functionCall"]
                 msg_parts.append(
