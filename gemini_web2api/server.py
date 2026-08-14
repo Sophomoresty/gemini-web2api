@@ -25,21 +25,30 @@ def _upload_images(images: list) -> list:
     if not images:
         return None
     file_refs = []
-    for item in images:
+    failed = []
+    for idx, item in enumerate(images):
         if not (isinstance(item, tuple) and len(item) == 2):
+            log(f"Warning: skipping malformed image item at index {idx}")
             continue
         data, mime = item
         if isinstance(data, str):
             data = fetch_image_bytes(data)
             mime = mime or "image/png"
         if not data:
-            raise RuntimeError("image fetch failed")
+            failed.append(f"image {idx+1}: fetch failed")
+            continue
         mime = detect_image_mime(data, mime or "image/png")
         try:
             ref = upload_image(data, "image.png", mime or "image/png")
             file_refs.append(ref)
         except Exception as e:
-            raise RuntimeError(f"image upload failed: {e}") from e
+            failed.append(f"image {idx+1}: {e}")
+
+    if failed and not file_refs:
+        raise RuntimeError(f"all image uploads failed: {'; '.join(failed)}")
+    if failed:
+        log(f"Warning: partial image upload success, {len(failed)} failed: {'; '.join(failed)}")
+
     return file_refs if file_refs else None
 
 

@@ -6,6 +6,8 @@ import urllib.parse
 import time
 import ssl
 import re
+import socket
+import ipaddress
 from urllib.parse import urlparse
 
 from .config import CONFIG
@@ -152,12 +154,33 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
     return file_ref
 
 
+def _is_private_ip(hostname: str) -> bool:
+    """Check if hostname resolves to a private/internal IP address."""
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    except ValueError:
+        pass
+    try:
+        ip_str = socket.gethostbyname(hostname)
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    except (socket.gaierror, ValueError):
+        return True
+
+
 def fetch_image_bytes(url: str) -> bytes:
-    """Fetch image from URL."""
+    """Fetch image from URL. Blocks private/internal addresses to prevent SSRF."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         log(f"Image fetch skipped for unsupported URL scheme: {parsed.scheme or 'none'}")
         return b""
+
+    hostname = parsed.hostname or parsed.netloc
+    if not hostname or _is_private_ip(hostname):
+        log(f"Image fetch blocked: private/internal address {hostname}")
+        return b""
+
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         proxy = CONFIG.get("proxy")
