@@ -4,9 +4,13 @@
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+    "gemini-3.7-flash": {
+        "mode": 1, "think": 4,
+        "desc": "Latest all-around model (Gemini 3.7 Flash)",
+    },
     "gemini-3.6-flash": {
         "mode": 1, "think": 4,
-        "desc": "Latest all-around model (Gemini 3.6 Flash)",
+        "desc": "All-around model (Gemini 3.6 Flash)",
     },
     "gemini-3.5-flash": {
         "mode": 1, "think": 4,
