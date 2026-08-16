@@ -1,23 +1,92 @@
 """HTTP server: OpenAI-compatible API endpoints."""
+from __future__ import annotations
+
+import base64
+import itertools
 import json
+import re
 import time
 import uuid
-import re
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-from .config import CONFIG
-from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
-from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
-from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
+from .config import CONFIG
+from .gemini import (
+    generate,
+    generate_image_structured,
+    generate_stream,
+    get_full_size_image,
+    log,
+)
+from .generated_image import download_generated_image, resolve_generated_image_url
+from .models import MODELS, resolve_model
+from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
+from .tools import (
+    google_contents_to_prompt,
+    messages_to_prompt,
+    parse_google_function_calls,
+    parse_tool_calls,
+)
+
+_CHAT_IMAGE_REQUEST = re.compile(
+    r"\b(?:generate|create|make|draw|render|paint)\s+"
+    r"(?:(?:me|us)\s+)?(?:(?:an?|the)\s+)?"
+    r"(?:image|picture|photo|illustration|artwork|icon|logo|portrait)\b",
+    re.IGNORECASE,
+)
+
+
+def _latest_user_text(messages) -> str:
+    """Extract only the latest user turn for intent-sensitive routing."""
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict)
+                and part.get("type") in ("text", "input_text")
+                and isinstance(part.get("text"), str)
+            )
+        return ""
+    return ""
+
+
+def _chat_image_prompt(request: dict) -> str | None:
+    """Return an explicit image-generation prompt from the latest user turn."""
+    text = _latest_user_text(request.get("messages"))
+    modalities = request.get("modalities")
+    explicitly_requested = isinstance(modalities, list) and "image" in modalities
+    if explicitly_requested or _CHAT_IMAGE_REQUEST.search(text):
+        return text.strip() or None
+    return None
 
 
 def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
     c = len(text or "") // 4
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _generated_image_output(prompt: str, response_format: str):
+    """Generate one image and return its optional text plus OpenAI output data."""
+    result = generate_image_structured(prompt)
+    if not result.images:
+        raise RuntimeError("Gemini returned no generated image metadata")
+    source_url = get_full_size_image(result.images[0]) or result.images[0].url
+    if response_format == "url":
+        data = {"url": resolve_generated_image_url(source_url)}
+    else:
+        image_bytes, _mime = download_generated_image(source_url)
+        data = {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
+    return result.text, data
 
 
 def _upload_images(images: list) -> list:
@@ -35,9 +104,12 @@ def _upload_images(images: list) -> list:
         if not data:
             raise RuntimeError("image fetch failed")
         mime = detect_image_mime(data, mime or "image/png")
+        filename = "image.png"
         try:
-            ref = upload_image(data, "image.png", mime or "image/png")
-            file_refs.append(ref)
+            ref = upload_image(data, filename, mime or "image/png")
+            # Gemini's current attachment format requires both the uploaded
+            # reference and its filename; retain both through generation.
+            file_refs.append((ref, filename))
         except Exception as e:
             raise RuntimeError(f"image upload failed: {e}") from e
     return file_refs if file_refs else None
@@ -154,6 +226,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             body = self._read_request_body()
             if self.path == "/v1/chat/completions":
                 self._handle_chat(body)
+            elif self.path == "/v1/images/generations":
+                self._handle_image_generation(body)
             elif self.path == "/v1/responses":
                 self._handle_responses(body)
             elif ":streamGenerateContent" in self.path:
@@ -171,6 +245,37 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except:
                 pass
 
+    # ─── /v1/images/generations ───────────────────────────────────────────────
+
+    def _handle_image_generation(self, body: bytes):
+        req = self._parse_body(body)
+        if not isinstance(req, dict):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        unsupported = [name for name in ("stream", "size", "quality", "style") if name in req]
+        prompt = req.get("prompt")
+        if unsupported or not isinstance(prompt, str) or not prompt.strip():
+            self.send_json({"error": {"message": "invalid image generation request"}}, 400)
+            return
+        if "n" in req and (not isinstance(req["n"], int) or isinstance(req["n"], bool) or req["n"] != 1):
+            self.send_json({"error": {"message": "only n=1 is supported"}}, 400)
+            return
+        response_format = req.get("response_format", "b64_json")
+        if response_format not in ("b64_json", "url"):
+            self.send_json({"error": {"message": "response_format must be b64_json or url"}}, 400)
+            return
+        model_value = req.get("model")
+        if model_value is not None and not isinstance(model_value, str):
+            self.send_json({"error": {"message": "invalid model"}}, 400)
+            return
+        try:
+            # Gemini Web selects its image route independently of text models.
+            _text, data = _generated_image_output(prompt, response_format)
+        except Exception as e:
+            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            return
+        self.send_json({"created": int(time.time()), "data": [data]})
+
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
 
     def _handle_chat(self, body: bytes):
@@ -186,6 +291,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
+        image_prompt = _chat_image_prompt(req)
         prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
@@ -193,6 +299,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        precomputed_text = None
+        if image_prompt:
+            try:
+                generated_text, image_data = _generated_image_output(image_prompt, "url")
+                image_markdown = f"![Generated image]({image_data['url']})"
+                precomputed_text = "\n\n".join(
+                    part for part in (generated_text, image_markdown) if part
+                )
+                # Image generation is a native route, not a function call.
+                tools = None
+                tool_choice = "none"
+                images = []
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
@@ -200,6 +321,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         if stream and (not tools or tool_choice == "none"):
+            # Prime the iterator before committing HTTP 200/SSE headers so an
+            # immediate upstream rejection remains a normal JSON 502.
+            try:
+                if precomputed_text is not None:
+                    deltas = iter([precomputed_text])
+                elif file_refs:
+                    deltas = iter([
+                        generate(prompt, model_id, think_mode, file_refs, extra_fields)
+                    ])
+                else:
+                    deltas = iter(
+                        generate_stream(prompt, model_id, think_mode, None, extra_fields)
+                    )
+                first_delta = next(deltas, None)
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
             try:
                 self._start_sse()
                 first_chunk = {
@@ -215,7 +353,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in itertools.chain(
+                    [first_delta] if first_delta else [], deltas
+                ):
+                    if not delta:
+                        continue
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -229,10 +371,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+                error = {"error": {"message": f"upstream error: {e}",
+                                   "type": "upstream_error"}}
+                try:
+                    self.wfile.write(f"data: {json.dumps(error)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = (precomputed_text if precomputed_text is not None else
+                    generate(prompt, model_id, think_mode, file_refs, extra_fields))
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -275,7 +426,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         input_items = req.get("input", [])
-        tools = req.get("tools")
+        raw_tools = req.get("tools")
+        image_generation_requested = isinstance(raw_tools, list) and any(
+            isinstance(tool, dict) and tool.get("type") == "image_generation"
+            for tool in raw_tools
+        )
+        # Image generation is a native request signal, not an emulated function.
+        tools = ([tool for tool in raw_tools
+                  if isinstance(tool, dict) and tool.get("type") != "image_generation"]
+                 if isinstance(raw_tools, list) else raw_tools)
         messages = []
         if req.get("instructions"):
             messages.append({"role": "system", "content": req["instructions"]})
@@ -323,9 +482,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        if image_generation_requested and images:
+            self.send_json({
+                "error": {"message": "image generation with input images is not supported"}
+            }, 400)
+            return
+
+        generated_image_call = None
         try:
             file_refs = _upload_images(images)
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            if image_generation_requested:
+                text, image_data = _generated_image_output(prompt, "b64_json")
+                generated_image_call = {
+                    "type": "image_generation_call",
+                    "id": f"imggen_{uuid.uuid4().hex[:12]}",
+                    "status": "completed",
+                    "result": image_data["b64_json"],
+                }
+            else:
+                text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -341,9 +516,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             for tc in tool_calls:
                 output.append({"type": "function_call", "id": tc["id"], "call_id": tc["id"],
                                "name": tc["function"]["name"], "arguments": tc["function"]["arguments"], "status": "completed"})
-        if text or not tool_calls:
+        if text or (not tool_calls and not generated_image_call):
             output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
+        if generated_image_call:
+            output.append(generated_image_call)
 
         if req.get("stream"):
             self._start_sse()
@@ -416,6 +593,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         item_id=item["id"],
                         output_index=output_index,
                         arguments=item["arguments"],
+                    )
+                    emit(
+                        "response.output_item.done",
+                        output_index=output_index,
+                        item=item,
+                    )
+                elif item["type"] == "image_generation_call":
+                    # The image is already downloaded and validated before SSE headers.
+                    emit(
+                        "response.output_item.added",
+                        output_index=output_index,
+                        item={"type": "image_generation_call", "id": item["id"], "status": "in_progress"},
                     )
                     emit(
                         "response.output_item.done",
@@ -516,9 +705,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and not has_tools:
             try:
+                deltas = iter(
+                    [generate(prompt, model_id, think_mode, file_refs, extra_fields)]
+                    if file_refs else
+                    generate_stream(prompt, model_id, think_mode, None, extra_fields)
+                )
+                first_delta = next(deltas, None)
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
+            try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in itertools.chain(
+                    [first_delta] if first_delta else [], deltas
+                ):
                     if not delta:
                         continue
                     full_text += delta
@@ -543,6 +744,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Google stream error: {e}")
+                error = {"error": {"code": 502, "message": f"upstream error: {e}",
+                                   "status": "UNAVAILABLE"}}
+                try:
+                    self.wfile.write(f"data: {json.dumps(error)}\n\n".encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             return
 
         try:
