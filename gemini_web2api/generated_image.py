@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 try:
     from curl_cffi import requests as curl_requests
@@ -201,8 +201,14 @@ def _limits() -> tuple[int, int]:
 
 
 def _request_args(stream: bool) -> dict:
+    headers = {"Referer": "https://gemini.google.com/"}
+    # Lazy import avoids the generated-image/result import cycle in gemini.py.
+    from .gemini import load_cookie
+    cookie_str, _ = load_cookie()
+    if cookie_str:
+        headers["Cookie"] = cookie_str
     args = {
-        "headers": {"Referer": "https://gemini.google.com/"},
+        "headers": headers,
         "timeout": CONFIG["request_timeout_sec"],
         "impersonate": "chrome",
         "allow_redirects": False,
@@ -242,6 +248,20 @@ def _read_mediator_url(response) -> str:
     return url
 
 
+def _with_gemini_preview_params(url: str) -> str:
+    """Apply the preview transform used by Gemini Web before resolving gg-dl."""
+    parsed = urlsplit(validate_generated_image_url(url))
+    path = parsed.path
+    if path.startswith("/gg-dl/") and "=" not in path.rsplit("/", 1)[-1]:
+        path += "=s1024-rj"
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    auth_user = CONFIG.get("auth_user")
+    if auth_user is not None and auth_user != "":
+        query.setdefault("authuser", str(auth_user))
+    query.setdefault("alr", "yes")
+    return urlunsplit((parsed.scheme, parsed.netloc, path, urlencode(query), ""))
+
+
 def resolve_generated_image_url(url: str) -> str:
     """Resolve Gemini's bounded text mediators to a final image URL.
 
@@ -251,7 +271,7 @@ def resolve_generated_image_url(url: str) -> str:
     """
     if not HAS_CURL_CFFI:
         raise RuntimeError("curl_cffi is required for generated image download")
-    current = validate_generated_image_url(url)
+    current = _with_gemini_preview_params(url)
     _, max_redirects = _limits()
     redirects = mediators = 0
     source_is_mediator = False
