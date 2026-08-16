@@ -25,7 +25,7 @@ from gemini_web2api.generated_image import (
     validate_generated_image_url,
 )
 from gemini_web2api.multimodal import _get_page_tokens, fetch_image_bytes
-from gemini_web2api.server import GeminiHandler, ThreadedServer
+from gemini_web2api.server import GeminiHandler, ThreadedServer, _chat_image_prompt
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
 
 
@@ -418,6 +418,28 @@ class RemoteImageFetchTests(unittest.TestCase):
 
 
 class MessageParsingTests(unittest.TestCase):
+    def test_chat_image_prompt_uses_only_explicit_latest_user_intent(self):
+        request = {
+            "messages": [
+                {"role": "user", "content": "generate an image of an old prompt"},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "Can you generate an image of a pink cat?"},
+            ],
+        }
+        self.assertEqual(
+            _chat_image_prompt(request),
+            "Can you generate an image of a pink cat?",
+        )
+        self.assertIsNone(_chat_image_prompt({
+            "messages": [{"role": "user", "content": "Generate a description of this image"}],
+        }))
+        self.assertIsNone(_chat_image_prompt({
+            "messages": [
+                {"role": "user", "content": "generate an image of a cat"},
+                {"role": "user", "content": "What did I ask for?"},
+            ],
+        }))
+
     def test_messages_to_prompt_extracts_openai_image_url_data_url(self):
         image_data = base64.b64encode(b"fake png").decode()
 
@@ -563,6 +585,80 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(chunks[1]["choices"][0]["delta"], {"content": "hel"})
         self.assertEqual(chunks[2]["choices"][0]["delta"], {"content": "lo"})
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server._upload_images")
+    @mock.patch("gemini_web2api.server.generate_stream")
+    @mock.patch("gemini_web2api.server.generate")
+    @mock.patch("gemini_web2api.server._generated_image_output")
+    def test_chat_image_request_streams_renderable_markdown(
+        self, generated_image, generate, generate_stream, upload_images
+    ):
+        generated_image.return_value = (
+            "",
+            {"url": "https://lh3.googleusercontent.com/generated-cat"},
+        )
+        image_data = base64.b64encode(b"old image").decode()
+        status, headers, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "stream": True,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                        }, {"type": "text", "text": "What is this?"}],
+                    },
+                    {"role": "assistant", "content": "An earlier image."},
+                    {"role": "user", "content": "Generate an image of a pink cat"},
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "clock",
+                        "description": "Get time",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }],
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        self.assertIn(
+            "![Generated image](https://lh3.googleusercontent.com/generated-cat)",
+            body,
+        )
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+        generated_image.assert_called_once_with(
+            "Generate an image of a pink cat", "url"
+        )
+        upload_images.assert_called_once_with([])
+        generate.assert_not_called()
+        generate_stream.assert_not_called()
+
+    @mock.patch(
+        "gemini_web2api.server._generated_image_output",
+        side_effect=RuntimeError("image generation failed"),
+    )
+    def test_chat_image_request_fails_before_sse(self, _generated_image):
+        status, headers, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "stream": True,
+                "messages": [{
+                    "role": "user",
+                    "content": "Generate an image of a pink cat",
+                }],
+            },
+        )
+
+        self.assertEqual(status, 502)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertIn("image generation failed", json.loads(body)["error"]["message"])
 
     @mock.patch("gemini_web2api.server.generate_stream")
     def test_chat_stream_returns_json_error_before_sse(self, generate_stream):

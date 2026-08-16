@@ -1,4 +1,6 @@
 """HTTP server: OpenAI-compatible API endpoints."""
+from __future__ import annotations
+
 import base64
 import itertools
 import json
@@ -26,6 +28,45 @@ from .tools import (
     parse_google_function_calls,
     parse_tool_calls,
 )
+
+_CHAT_IMAGE_REQUEST = re.compile(
+    r"\b(?:generate|create|make|draw|render|paint)\s+"
+    r"(?:(?:me|us)\s+)?(?:(?:an?|the)\s+)?"
+    r"(?:image|picture|photo|illustration|artwork|icon|logo|portrait)\b",
+    re.IGNORECASE,
+)
+
+
+def _latest_user_text(messages) -> str:
+    """Extract only the latest user turn for intent-sensitive routing."""
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict)
+                and part.get("type") in ("text", "input_text")
+                and isinstance(part.get("text"), str)
+            )
+        return ""
+    return ""
+
+
+def _chat_image_prompt(request: dict) -> str | None:
+    """Return an explicit image-generation prompt from the latest user turn."""
+    text = _latest_user_text(request.get("messages"))
+    modalities = request.get("modalities")
+    explicitly_requested = isinstance(modalities, list) and "image" in modalities
+    if explicitly_requested or _CHAT_IMAGE_REQUEST.search(text):
+        return text.strip() or None
+    return None
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -250,6 +291,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
+        image_prompt = _chat_image_prompt(req)
         prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
@@ -257,6 +299,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        precomputed_text = None
+        if image_prompt:
+            try:
+                generated_text, image_data = _generated_image_output(image_prompt, "url")
+                image_markdown = f"![Generated image]({image_data['url']})"
+                precomputed_text = "\n\n".join(
+                    part for part in (generated_text, image_markdown) if part
+                )
+                # Image generation is a native route, not a function call.
+                tools = None
+                tool_choice = "none"
+                images = []
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
@@ -267,11 +324,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
             # Prime the iterator before committing HTTP 200/SSE headers so an
             # immediate upstream rejection remains a normal JSON 502.
             try:
-                deltas = iter(
-                    [generate(prompt, model_id, think_mode, file_refs, extra_fields)]
-                    if file_refs else
-                    generate_stream(prompt, model_id, think_mode, None, extra_fields)
-                )
+                if precomputed_text is not None:
+                    deltas = iter([precomputed_text])
+                elif file_refs:
+                    deltas = iter([
+                        generate(prompt, model_id, think_mode, file_refs, extra_fields)
+                    ])
+                else:
+                    deltas = iter(
+                        generate_stream(prompt, model_id, think_mode, None, extra_fields)
+                    )
                 first_delta = next(deltas, None)
             except Exception as e:
                 self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
@@ -320,7 +382,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = (precomputed_text if precomputed_text is not None else
+                    generate(prompt, model_id, think_mode, file_refs, extra_fields))
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
