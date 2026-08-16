@@ -49,10 +49,14 @@ def _get_page_tokens() -> dict:
             # currently loaded Gemini Web session.
             ("f_sid", r'"FdrFJe":\s*"([^"]+)"'),
             ("at", r'"SNlM0e":\s*"([^"]+)"'),
+            # The account page carries the currently available image model as
+            # an internal ID, capacity tail, and model category.  These are
+            # model-routing metadata, not session credentials.
+            ("image_model", r'\["(cf[a-f0-9]{14})",\s*(\d+),\s*(6)\]'),
         ]:
             m = re.search(pattern, html)
             if m:
-                tokens[key] = m.group(1)
+                tokens[key] = (m.groups() if key == "image_model" else m.group(1))
         return tokens
     except Exception as e:
         log(f"Page token fetch failed: {e}")

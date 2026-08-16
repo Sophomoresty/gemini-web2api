@@ -17,6 +17,9 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    # Generated image output only; values above the hard safety caps are ignored.
+    "generated_image_max_bytes": 10 * 1024 * 1024,
+    "generated_image_max_redirects": 3,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

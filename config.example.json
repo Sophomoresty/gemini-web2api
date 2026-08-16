@@ -14,5 +14,7 @@
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "generated_image_max_bytes": 10485760,
+  "generated_image_max_redirects": 3
 }

@@ -20,6 +20,7 @@
 - **流式输出**: 基于 `httpx` 的 SSE Streaming 支持
 - **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
 - **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
+- **图片输出**: 支持 OpenAI Images 和 Responses 图片生成输出，并对下载进行边界与格式校验
 
 ## 快速开始
 
@@ -239,9 +240,26 @@ resp = client.chat.completions.create(
 )
 ```
 
+## 图片输出
+
+`POST /v1/images/generations` 接受文本 `prompt`、可选 `model` 与 `n: 1`，返回一个
+OpenAI 兼容结果。`response_format` 默认是 `b64_json`，优先使用 Gemini 全尺寸 RPC，
+该 RPC 不可用时回退预览图；指定 `url` 时返回已验证的最终 HTTPS
+`googleusercontent.com` 图片 URL（仅解析文本中转，不下载图片字节）。`stream`、`size`、`quality` 和
+`style` 有意不支持。Responses API 的 `tools` 中也可使用
+`{ "type": "image_generation" }`，会在保留文本输出的同时追加一个带 base64 结果的
+`image_generation_call`。
+
+base64 输出仅使用 Chrome 模拟下载 HTTPS 的精确或子域
+`googleusercontent.com` 地址：最多 3 次重定向、10 MiB，且 PNG/JPEG/WebP 文件头必须
+与 HTTP Content-Type 一致。这些限制仅用于 Gemini 生成的输出，不改变其他图片输入 URL。
+配置项 `generated_image_max_bytes` 与 `generated_image_max_redirects` 可以进一步降低限制，
+但不能超过硬编码的 10 MiB / 3 次重定向上限。
+
 ## 已知限制
 
 - **图片输入需要 `curl_cffi`，且可能需要 Cookie**: 多模态输入使用 Gemini 网页端上传及 Chrome 模拟生成请求。上传或生成失败时，请配置 Gemini cookie。图片流式请求会返回一个完整结果，而非增量文本。
+- **图片生成协议可能变化**: 图片输出依赖 Gemini 未公开的 GUI 请求体和全尺寸 RPC。全尺寸 RPC 不可用时会回退到已验证预览图；未实现图片编辑、缓存或代理。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
 - **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.

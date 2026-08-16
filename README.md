@@ -20,6 +20,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Streaming**: SSE streaming support via `httpx`
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
+- **Image Output**: OpenAI Images and Responses image-generation output with bounded, verified downloads
 
 ## Quick Start
 
@@ -266,9 +267,28 @@ resp = client.chat.completions.create(
 )
 ```
 
+## Image Output
+
+`POST /v1/images/generations` accepts a text `prompt`, optional `model`, and `n: 1`.
+It returns one OpenAI-compatible item. `response_format` defaults to `b64_json`, which
+prefers Gemini's full-size RPC URL and falls back to preview when that RPC is unavailable.
+Use `url` to return a validated final HTTPS `googleusercontent.com` image URL (text
+mediators are resolved without downloading the image bytes).
+`stream`, `size`, `quality`, and `style` are intentionally unsupported. The Responses API
+also recognizes `{ "type": "image_generation" }` in `tools` and emits one
+`image_generation_call` containing base64 output alongside any generated text.
+
+For base64 output, the server downloads only HTTPS exact/subdomain
+`googleusercontent.com` URLs with Chrome impersonation, at most three redirects and 10 MiB.
+PNG, JPEG, and WebP bytes and their HTTP content type must agree. This applies only to
+Gemini-generated output, not unrelated image input URLs. `generated_image_max_bytes` and
+`generated_image_max_redirects` in configuration can lower these limits, but cannot raise
+the hard 10 MiB / three-redirect caps.
+
 ## Limitations
 
 - **Image input requires `curl_cffi` and may require cookies**: Multimodal input uses Gemini Web's upload and Chrome-impersonated generation requests. If upload or generation fails, configure a Gemini cookie. Image streaming returns one complete generated result rather than incremental text.
+- **Generated image protocol can change**: Image output uses Gemini's undocumented GUI payload and full-size RPC. The server falls back to the validated preview when full-size RPC resolution is unavailable; edits, caching, and proxying are not implemented.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.

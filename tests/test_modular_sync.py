@@ -7,7 +7,14 @@ from unittest import mock
 from urllib.parse import parse_qs
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
-from gemini_web2api.gemini import _build_payload, _generate_file_with_curl, generate_stream
+from gemini_web2api.gemini import (
+    _batch_response_url, _build_image_payload, _build_payload, _generate_file_with_curl,
+    build_model_header, generate_stream,
+)
+from gemini_web2api.generated_image import (
+    download_generated_image, extract_generation_result, resolve_generated_image_url,
+    validate_generated_image_url,
+)
 from gemini_web2api.multimodal import _get_page_tokens
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
@@ -80,6 +87,137 @@ class PayloadPersistenceTests(unittest.TestCase):
 
         self.assertEqual(len(inner), 102)
         self.assertIsNone(inner[80])
+
+    def test_image_payload_has_capture_derived_shape_and_fresh_values(self):
+        first = _decode_payload(_build_image_payload("make a fox", "REQUEST-UUID"))
+        second = _decode_payload(_build_image_payload("make a fox", "REQUEST-UUID"))
+
+        self.assertEqual(len(first), 97)
+        self.assertEqual(first[0][0], "make a fox")
+        self.assertTrue(first[3].startswith("!"))
+        self.assertEqual(len(first[3]), 2539)
+        self.assertNotEqual(first[3], second[3])
+        self.assertRegex(first[4], r"^[a-f0-9]{32}$")
+        self.assertNotEqual(first[4], second[4])
+        self.assertEqual(first[17], [[0]])
+        self.assertEqual(first[41], [1])
+        self.assertEqual(first[59], "REQUEST-UUID")
+        self.assertEqual({i: first[i] for i in (6, 7, 10, 11, 18, 27, 30, 53, 61, 67, 68, 79, 80, 91, 96)}, {
+            6: [0], 7: 1, 10: 1, 11: 0, 18: 0, 27: 1, 30: [4], 53: 0,
+            61: [], 67: 0, 68: 1, 79: 6, 80: 1, 91: 0, 96: 0,
+        })
+
+    def test_model_header_uses_public_routing_constants(self):
+        headers = build_model_header("cf41b0e0dd7d53e5", 1, 6)
+        self.assertIn('"cf41b0e0dd7d53e5"', headers["x-goog-ext-525001261-jspb"])
+        self.assertEqual(headers["x-goog-ext-73010989-jspb"], "[0]")
+        self.assertEqual(headers["x-goog-ext-73010990-jspb"], "[0,0,0]")
+
+
+class GeneratedImageTests(unittest.TestCase):
+    def _raw_frame(self, candidate, cid="chat-id", rid="reply-id"):
+        frame = [None, [cid, rid], None, None, [candidate]]
+        return json.dumps([["wrb.fr", None, json.dumps(frame)]])
+
+    def test_extracts_generated_image_metadata_from_rich_content_field_seven(self):
+        image_entry = [
+            [None, None, None, [None, None, "cat alt", "https://lh3.googleusercontent.com/a"]],
+            ["image-id"],
+        ]
+        rich_content = [None] * 7 + [[[image_entry]]]
+        candidate = ["candidate-id", ["A cat"]] + [None] * 10 + [rich_content]
+        result = extract_generation_result(self._raw_frame(candidate), lambda text: text)
+
+        self.assertEqual(result.text, "A cat")
+        self.assertEqual(len(result.images), 1)
+        self.assertEqual(result.images[0].url, "https://lh3.googleusercontent.com/a")
+        self.assertEqual(result.images[0].alt, "cat alt")
+        self.assertEqual(result.images[0].image_id, "image-id")
+        self.assertEqual(result.images[0].rcid, "candidate-id")
+        self.assertEqual(result.images[0].cid, "chat-id")
+        self.assertEqual(result.images[0].rid, "reply-id")
+
+    def test_extracts_generated_image_metadata_from_sparse_field_eight(self):
+        image_entry = [
+            [None, None, None, [None, None, "fox alt", "https://lh3.googleusercontent.com/fox"]],
+            ["fox-image-id"],
+        ]
+        rich_content = [{"8": [[image_entry]]}]
+        candidate = ["candidate-id", ["A fox"]] + [None] * 10 + [rich_content]
+
+        result = extract_generation_result(self._raw_frame(candidate), lambda text: text)
+
+        self.assertEqual(result.text, "A fox")
+        self.assertEqual(len(result.images), 1)
+        self.assertEqual(result.images[0].url, "https://lh3.googleusercontent.com/fox")
+        self.assertEqual(result.images[0].image_id, "fox-image-id")
+
+    def test_generated_url_validation_rejects_non_google_and_ssrf_shapes(self):
+        self.assertEqual(
+            validate_generated_image_url("https://lh3.googleusercontent.com/a"),
+            "https://lh3.googleusercontent.com/a",
+        )
+        for url in (
+            "http://lh3.googleusercontent.com/a", "https://evilgoogleusercontent.com/a",
+            "https://googleusercontent.com@evil.example/a", "https://127.0.0.1/a",
+            "https://lh3.googleusercontent.com:444/a",
+        ):
+            with self.assertRaises(ValueError):
+                validate_generated_image_url(url)
+
+    @mock.patch("gemini_web2api.generated_image.curl_requests")
+    @mock.patch("gemini_web2api.generated_image.HAS_CURL_CFFI", True)
+    def test_generated_download_checks_redirect_host_size_magic_and_type(self, requests):
+        response = requests.get.return_value
+        response.status_code = 200
+        response.headers = {"Content-Type": "image/png", "Content-Length": "8"}
+        response.iter_content.return_value = [b"\x89PNG\r\n\x1a\n"]
+        response.close = mock.Mock()
+
+        data, mime = download_generated_image("https://lh3.googleusercontent.com/a")
+
+        self.assertEqual(data, b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(mime, "image/png")
+        self.assertFalse(requests.get.call_args.kwargs["allow_redirects"])
+        self.assertEqual(requests.get.call_args.kwargs["impersonate"], "chrome")
+
+    @mock.patch("gemini_web2api.generated_image.curl_requests")
+    @mock.patch("gemini_web2api.generated_image.HAS_CURL_CFFI", True)
+    def test_generated_url_resolves_exact_two_stage_text_mediators(self, requests):
+        first, second = mock.Mock(), mock.Mock()
+        first.status_code, first.headers = 200, {"Content-Type": "text/plain"}
+        first.iter_content.return_value = [b"https://work.fife.usercontent.google.com/a"]
+        second.status_code, second.headers = 200, {"Content-Type": "text/plain"}
+        second.iter_content.return_value = [b"https://lh3.googleusercontent.com/rd-gg-dl/a"]
+        first.close, second.close = mock.Mock(), mock.Mock()
+        requests.get.side_effect = [first, second]
+
+        self.assertEqual(resolve_generated_image_url("https://lh3.googleusercontent.com/gg-dl/a"),
+                         "https://lh3.googleusercontent.com/rd-gg-dl/a")
+        self.assertEqual(requests.get.call_count, 2)
+
+    @mock.patch("gemini_web2api.generated_image.curl_requests")
+    @mock.patch("gemini_web2api.generated_image.HAS_CURL_CFFI", True)
+    def test_generated_download_rejects_unsafe_redirect_and_type_mismatch(self, requests):
+        response = requests.get.return_value
+        response.status_code = 302
+        response.headers = {"Location": "https://example.com/not-an-image"}
+        response.close = mock.Mock()
+        with self.assertRaises(ValueError):
+            download_generated_image("https://lh3.googleusercontent.com/a")
+
+        response.status_code = 200
+        response.headers = {"Content-Type": "image/jpeg"}
+        response.iter_content.return_value = [b"\x89PNG\r\n\x1a\n"]
+        with self.assertRaises(ValueError):
+            download_generated_image("https://lh3.googleusercontent.com/a")
+
+
+class FullSizeImageTests(unittest.TestCase):
+    def test_batch_response_extracts_full_size_url(self):
+        payload = json.dumps([["wrb.fr", "c8o8Fe", json.dumps(["https://lh3.googleusercontent.com/gg-dl/final"])]])
+        raw = ")]}'" + chr(10) + str(len(payload)) + chr(10) + payload
+        self.assertEqual(_batch_response_url(raw), "https://lh3.googleusercontent.com/gg-dl/final")
 
 
 class FileGenerationTests(unittest.TestCase):
@@ -442,6 +580,71 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers["Content-Type"], "text/event-stream")
         self.assertIn('"text": "streamed"', body)
+
+    @mock.patch("gemini_web2api.server.resolve_generated_image_url", return_value="https://lh3.googleusercontent.com/rd-gg-dl/a")
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    @mock.patch("gemini_web2api.server.download_generated_image", return_value=(b"\x89PNG\r\n\x1a\n", "image/png"))
+    def test_image_generation_endpoint_returns_full_size_preferred_b64_or_resolved_url(self, download, generate_image_structured, full_size, resolve_url):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        image = GeneratedImage("https://lh3.googleusercontent.com/a")
+        generate_image_structured.return_value = GenerationResult(images=[image])
+
+        status, _, body = self.post_json("/v1/images/generations", {"prompt": "a cat"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["data"][0]["b64_json"], "iVBORw0KGgo=")
+        download.assert_called_once_with(image.url)
+
+        status, _, body = self.post_json("/v1/images/generations", {"prompt": "a cat", "response_format": "url"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["data"][0]["url"], "https://lh3.googleusercontent.com/rd-gg-dl/a")
+        resolve_url.assert_called_once_with(image.url)
+
+    def test_image_generation_endpoint_rejects_unsupported_options(self):
+        status, _, _ = self.post_json("/v1/images/generations", {"prompt": "a cat", "n": 2})
+        self.assertEqual(status, 400)
+        status, _, _ = self.post_json("/v1/images/generations", {"prompt": "a cat", "size": "1024x1024"})
+        self.assertEqual(status, 400)
+
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    @mock.patch("gemini_web2api.server.download_generated_image", return_value=(b"\x89PNG\r\n\x1a\n", "image/png"))
+    def test_responses_image_generation_is_native_and_streams_atomic_item(self, _download, generate_image_structured, _full_size):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generate_image_structured.return_value = GenerationResult(text="caption", images=[GeneratedImage("https://lh3.googleusercontent.com/a")])
+        status, headers, body = self.post_json("/v1/responses", {
+            "input": "make a cat", "tools": [{"type": "image_generation"}], "stream": True,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        events = _decode_sse(body)
+        image_events = [(name, event) for name, event in events if event.get("item", {}).get("type") == "image_generation_call"]
+        self.assertEqual([name for name, _ in image_events], ["response.output_item.added", "response.output_item.done"])
+        self.assertEqual(image_events[-1][1]["item"]["result"], "iVBORw0KGgo=")
+        self.assertEqual(events[-1][0], "response.completed")
+
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    @mock.patch("gemini_web2api.server.download_generated_image", return_value=(b"\x89PNG\r\n\x1a\n", "image/png"))
+    def test_responses_image_generation_non_stream_returns_completed_item(self, _download, generate_image_structured, _full_size):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generate_image_structured.return_value = GenerationResult(
+            text="caption", images=[GeneratedImage("https://lh3.googleusercontent.com/a")]
+        )
+
+        status, headers, body = self.post_json("/v1/responses", {
+            "input": "make a cat", "tools": [{"type": "image_generation"}],
+        })
+
+        response = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertEqual(response["object"], "response")
+        self.assertEqual(response["status"], "completed")
+        image_item = next(item for item in response["output"] if item["type"] == "image_generation_call")
+        self.assertTrue(image_item["id"].startswith("imggen_"))
+        self.assertEqual(image_item["status"], "completed")
+        self.assertEqual(image_item["result"], "iVBORw0KGgo=")
 
     @mock.patch("gemini_web2api.server.generate", return_value="hello")
     def test_responses_text_stream_has_complete_event_sequence(self, _generate):
