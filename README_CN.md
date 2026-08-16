@@ -16,7 +16,7 @@
 - **多模型**: Flash (3.6), 扩展思考 (2万字+输出), Pro, Auto, Lite
 - **思考深度**: 通过 `@think=N` 后缀调节 (0=最深, 4=最浅)
 - **联网搜索**: 内置互联网访问 (Gemini 原生搜索能力)
-- **跨平台**: 纯 Python, 仅一个可选依赖 (`httpx` 用于流式输出)
+- **跨平台**: 纯 Python，图片请求使用 `curl_cffi` 提供 Chrome 兼容性
 - **流式输出**: 基于 `httpx` 的 SSE Streaming 支持
 - **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
 - **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
@@ -24,7 +24,7 @@
 ## 快速开始
 
 ```bash
-pip install httpx
+pip install -r requirements.txt
 python gemini_web2api.py
 ```
 
@@ -241,7 +241,7 @@ resp = client.chat.completions.create(
 
 ## 已知限制
 
-- **图片上传可能需要 Cookie**: 多模态输入使用 Gemini 网页端图片上传接口。匿名上传失败时, 请配置 Gemini cookie。
+- **图片输入需要 `curl_cffi`，且可能需要 Cookie**: 多模态输入使用 Gemini 网页端上传及 Chrome 模拟生成请求。上传或生成失败时，请配置 Gemini cookie。图片流式请求会返回一个完整结果，而非增量文本。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
 - **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.
@@ -249,7 +249,8 @@ resp = client.chat.completions.create(
 ## 系统要求
 
 - Python 3.8+
-- `httpx` (`pip install httpx`) — 用于流式请求
+- `curl_cffi` (`pip install -r requirements.txt`) — Gemini 图片输入所需
+- `httpx` (`pip install httpx`) — 用于文本流式请求
 - 需要能访问 `gemini.google.com` (部分地区需代理)
 
 ## 工作原理

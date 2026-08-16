@@ -1,1 +1,2 @@
 httpx>=0.25
+curl_cffi>=0.7

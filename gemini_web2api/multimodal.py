@@ -13,17 +13,24 @@ from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
 
 
 def _get_page_tokens() -> dict:
-    """Fetch WIZ_global_data tokens from Gemini page (Push-ID, X-Client-Pctx)."""
+    """Fetch WIZ_global_data tokens from the configured Gemini account page."""
+    auth_user = CONFIG.get("auth_user")
+    account_prefix = "" if auth_user is None or auth_user == "" else f"/u/{auth_user}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": f"https://gemini.google.com{account_prefix}/app",
     }
+    if account_prefix:
+        headers["X-Goog-AuthUser"] = str(auth_user)
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
     try:
-        req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
+        req = urllib.request.Request(
+            f"https://gemini.google.com{account_prefix}/app", headers=headers
+        )
         proxy = CONFIG.get("proxy")
         if proxy:
             opener = urllib.request.build_opener(
@@ -38,7 +45,10 @@ def _get_page_tokens() -> dict:
         for key, pattern in [
             ("push_id", r'"qKIAYe":"([^"]+)"'),
             ("pctx", r'"Ylro7b":"([^"]+)"'),
-            ("at", r'"thykhd":"([^"]+)"'),
+            # These values bind file-bearing StreamGenerate requests to the
+            # currently loaded Gemini Web session.
+            ("f_sid", r'"FdrFJe":\s*"([^"]+)"'),
+            ("at", r'"SNlM0e":\s*"([^"]+)"'),
         ]:
             m = re.search(pattern, html)
             if m:
@@ -52,9 +62,15 @@ def _get_page_tokens() -> dict:
 _page_tokens_cache = {"tokens": {}, "ts": 0}
 
 
-def _cached_page_tokens() -> dict:
+def _cached_page_tokens(max_age: int = 600) -> dict:
+    """Return Gemini page tokens, refreshing when they are older than max_age.
+
+    File generation asks for a fresh page state because ``f.sid`` is a
+    short-lived frontend routing value; uploads can safely reuse the normal
+    cache.
+    """
     now = time.time()
-    if now - _page_tokens_cache["ts"] > 600:
+    if now - _page_tokens_cache["ts"] > max_age:
         _page_tokens_cache["tokens"] = _get_page_tokens()
         _page_tokens_cache["ts"] = now
     return _page_tokens_cache["tokens"]

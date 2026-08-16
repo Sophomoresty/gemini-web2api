@@ -15,6 +15,13 @@ try:
 except ImportError:
     HAS_HTTPX = False
 
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    curl_requests = None
+    HAS_CURL_CFFI = False
+
 from .config import CONFIG
 
 _ssl_ctx = None
@@ -85,7 +92,7 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-def _build_headers() -> dict:
+def _build_headers(request_uuid: str = None) -> dict:
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -94,6 +101,8 @@ def _build_headers() -> dict:
         "X-Same-Domain": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
+    if request_uuid:
+        headers["x-goog-ext-525005358-jspb"] = f'["{request_uuid}",1]'
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
     cookie_str, sapisid = load_cookie()
@@ -114,10 +123,26 @@ def _apply_chat_persistence_flags(inner: list) -> None:
         inner[41] = [2]
 
 
-def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    inner = [None] * 102
+def _normalise_file_ref(file_ref) -> list:
+    """Convert legacy refs and ``(ref, filename)`` pairs to Gemini's file shape."""
+    if isinstance(file_ref, (tuple, list)) and len(file_ref) == 2:
+        ref, filename = file_ref
+    else:
+        ref, filename = file_ref, "image.png"
+    if not isinstance(ref, str) or not ref:
+        raise ValueError("invalid uploaded file reference")
+    return [[ref], filename or "image.png"]
+
+
+def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+                   extra_fields: dict = None, xsrf_token: str = None,
+                   request_uuid: str = None) -> str:
+    # File-bearing requests use the current 81-slot Gemini Web protocol and
+    # require slot 80. Preserve the established text-only payload unchanged.
+    # Callers may still pass old plain string refs.
+    inner = [None] * (81 if file_refs else 102)
     if file_refs:
-        refs = [[None, None, ref] for ref in file_refs]
+        refs = [_normalise_file_ref(ref) for ref in file_refs]
         inner[0] = [prompt, 0, None, refs, None, None, 0]
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]
@@ -133,27 +158,37 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[30] = [4]
     _apply_chat_persistence_flags(inner)
     inner[53] = 0
-    inner[59] = str(uuid.uuid4())
+    inner[59] = request_uuid or str(uuid.uuid4())
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
+    if file_refs:
+        inner[80] = 1
     if extra_fields:
         for k, v in extra_fields.items():
             inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    if CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
+    if xsrf_token or CONFIG.get("xsrf_token"):
+        params["at"] = xsrf_token or CONFIG["xsrf_token"]
     return urllib.parse.urlencode(params)
 
 
-def _get_url() -> str:
+def _get_url(session_id: str = None) -> str:
     reqid = int(time.time()) % 1000000
     account_prefix = _account_prefix()
+    params = {
+        "bl": CONFIG["gemini_bl"],
+        "hl": "en",
+        "_reqid": reqid,
+        "rt": "c",
+    }
+    if session_id:
+        params["f.sid"] = session_id
     return (
         f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
-        "assistant.lamda.BardFrontendService/StreamGenerate"
-        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+        "assistant.lamda.BardFrontendService/StreamGenerate?"
+        f"{urllib.parse.urlencode(params)}"
     )
 
 
@@ -202,9 +237,56 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
+def _generate_file_with_curl(prompt: str, model_id: int, think_mode: int, file_refs: list,
+                             extra_fields: dict = None) -> str:
+    """Send a file request with Chrome TLS/browser impersonation.
+
+    Gemini currently rejects otherwise valid uploaded-file requests from the
+    stdlib TLS stack. curl_cffi supplies the Chrome fingerprint used by Gemini
+    Web while retaining this project's cookie, proxy, and timeout settings.
+    """
+    if not HAS_CURL_CFFI:
+        raise RuntimeError("curl_cffi is required for Gemini image input")
+
+    # Import lazily because multimodal imports cookie helpers from this module.
+    from .multimodal import _cached_page_tokens
+    page_tokens = _cached_page_tokens(max_age=0)
+    request_uuid = str(uuid.uuid4()).upper()
+    body = _build_payload(
+        prompt, model_id, think_mode, file_refs, extra_fields,
+        xsrf_token=page_tokens.get("at"), request_uuid=request_uuid,
+    )
+    url = _get_url(page_tokens.get("f_sid"))
+    headers = _build_headers(request_uuid)
+    request_args = {
+        "data": body,
+        "headers": headers,
+        "timeout": CONFIG["request_timeout_sec"],
+        "impersonate": "chrome",
+    }
+    if CONFIG.get("proxy"):
+        request_args["proxy"] = CONFIG["proxy"]
+
+    last_err = None
+    for attempt in range(CONFIG["retry_attempts"]):
+        try:
+            response = curl_requests.post(url, **request_args)
+            response.raise_for_status()
+            return extract_response_text(response.text)
+        except Exception as e:
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"File generation retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
+    raise last_err
+
+
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+    if file_refs:
+        return _generate_file_with_curl(prompt, model_id, think_mode, file_refs, extra_fields)
+
+    body = _build_payload(prompt, model_id, think_mode, extra_fields=extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()
@@ -233,7 +315,17 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
-    """Streaming generation via httpx with retry on connection failure."""
+    """Streaming generation via httpx with retry on connection failure.
+
+    File requests intentionally yield one non-stream result because Gemini
+    requires Chrome impersonation for those requests.
+    """
+    if file_refs:
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        if text:
+            yield text
+        return
+
     if not HAS_HTTPX:
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:

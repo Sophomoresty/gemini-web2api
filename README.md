@@ -16,7 +16,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Multiple Models**: Flash (3.6), Extended Thinking (20k+ char output), Pro, Auto, Lite
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
-- **Cross-Platform**: Pure Python, single optional dependency (`httpx` for streaming)
+- **Cross-Platform**: Pure Python with `curl_cffi` for Chrome-compatible image requests
 - **Streaming**: SSE streaming support via `httpx`
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
@@ -24,7 +24,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 ## Quick Start
 
 ```bash
-pip install httpx
+pip install -r requirements.txt
 python gemini_web2api.py
 ```
 
@@ -268,7 +268,7 @@ resp = client.chat.completions.create(
 
 ## Limitations
 
-- **Image upload may require cookies**: Multimodal input uses Gemini Web's image upload endpoint. If anonymous upload fails, configure a Gemini cookie.
+- **Image input requires `curl_cffi` and may require cookies**: Multimodal input uses Gemini Web's upload and Chrome-impersonated generation requests. If upload or generation fails, configure a Gemini cookie. Image streaming returns one complete generated result rather than incremental text.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
@@ -276,7 +276,8 @@ resp = client.chat.completions.create(
 ## Requirements
 
 - Python 3.8+
-- `httpx` (`pip install httpx`) — used for streaming requests
+- `curl_cffi` (`pip install -r requirements.txt`) — required for Gemini image input
+- `httpx` (`pip install httpx`) — used for text streaming requests
 - Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
 
 ## How It Works

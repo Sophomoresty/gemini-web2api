@@ -35,9 +35,12 @@ def _upload_images(images: list) -> list:
         if not data:
             raise RuntimeError("image fetch failed")
         mime = detect_image_mime(data, mime or "image/png")
+        filename = "image.png"
         try:
-            ref = upload_image(data, "image.png", mime or "image/png")
-            file_refs.append(ref)
+            ref = upload_image(data, filename, mime or "image/png")
+            # Gemini's current attachment format requires both the uploaded
+            # reference and its filename; retain both through generation.
+            file_refs.append((ref, filename))
         except Exception as e:
             raise RuntimeError(f"image upload failed: {e}") from e
     return file_refs if file_refs else None
@@ -200,6 +203,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         if stream and (not tools or tool_choice == "none"):
+            # Image streaming uses a one-result fallback. Resolve it before
+            # committing HTTP 200/SSE headers so upstream failures remain a
+            # normal JSON 502 instead of a silently truncated stream.
+            file_stream_text = None
+            if file_refs:
+                try:
+                    file_stream_text = generate(
+                        prompt, model_id, think_mode, file_refs, extra_fields
+                    )
+                except Exception as e:
+                    self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                    return
             try:
                 self._start_sse()
                 first_chunk = {
@@ -215,7 +230,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                deltas = ([file_stream_text] if file_refs else
+                          generate_stream(prompt, model_id, think_mode, None, extra_fields))
+                for delta in deltas:
+                    if not delta:
+                        continue
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -515,10 +534,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
 
         if stream and not has_tools:
+            # As above, resolve the image fallback before sending SSE headers
+            # so file-generation failures can be reported as JSON errors.
+            file_stream_text = None
+            if file_refs:
+                try:
+                    file_stream_text = generate(
+                        prompt, model_id, think_mode, file_refs, extra_fields
+                    )
+                except Exception as e:
+                    self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                    return
             try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                deltas = ([file_stream_text] if file_refs else
+                          generate_stream(prompt, model_id, think_mode, None, extra_fields))
+                for delta in deltas:
                     if not delta:
                         continue
                     full_text += delta
