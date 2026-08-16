@@ -16,7 +16,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Multiple Models**: Flash (3.6), Extended Thinking (20k+ char output), Pro, Auto, Lite
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
-- **Cross-Platform**: Pure Python with `curl_cffi` for Chrome-compatible image requests
+- **Cross-Platform**: Python service with `curl_cffi` for Chrome-compatible image requests
 - **Streaming**: SSE streaming support via `httpx`
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
@@ -252,7 +252,10 @@ resp = client.chat.completions.create(
 ## Image Input
 
 OpenAI-style multimodal messages are supported for Chat Completions and the
-Responses API. Use either HTTP(S) image URLs or base64 data URLs:
+Responses API. Use either public HTTPS image URLs or base64 data URLs. Remote
+images are limited to 10 MiB and three redirects; private, loopback, link-local,
+and non-image responses are rejected. Remote image downloads use a direct,
+DNS-pinned connection instead of the configured proxy to preserve this boundary.
 
 ```python
 resp = client.chat.completions.create(
@@ -270,7 +273,9 @@ resp = client.chat.completions.create(
 ## Image Output
 
 `POST /v1/images/generations` accepts a text `prompt`, optional `model`, and `n: 1`.
-It returns one OpenAI-compatible item. `response_format` defaults to `b64_json`, which
+The `model` field is accepted for client compatibility; Gemini Web selects its image route
+independently of the text-model catalog. The endpoint returns one OpenAI-compatible item.
+`response_format` defaults to `b64_json`, which
 prefers Gemini's full-size RPC URL and falls back to preview when that RPC is unavailable.
 Use `url` to return a validated final HTTPS `googleusercontent.com` image URL (text
 mediators are resolved without downloading the image bytes).
@@ -280,14 +285,14 @@ also recognizes `{ "type": "image_generation" }` in `tools` and emits one
 
 For base64 output, the server downloads only HTTPS exact/subdomain
 `googleusercontent.com` URLs with Chrome impersonation, at most three redirects and 10 MiB.
-PNG, JPEG, and WebP bytes and their HTTP content type must agree. This applies only to
-Gemini-generated output, not unrelated image input URLs. `generated_image_max_bytes` and
+PNG, JPEG, and WebP bytes and their HTTP content type must agree.
+`generated_image_max_bytes` and
 `generated_image_max_redirects` in configuration can lower these limits, but cannot raise
 the hard 10 MiB / three-redirect caps.
 
 ## Limitations
 
-- **Image input requires `curl_cffi` and may require cookies**: Multimodal input uses Gemini Web's upload and Chrome-impersonated generation requests. If upload or generation fails, configure a Gemini cookie. Image streaming returns one complete generated result rather than incremental text.
+- **Image requests require `curl_cffi` and may require cookies**: Multimodal input and generated-image output use Chrome-impersonated requests. If upload or generation fails, configure a Gemini cookie. Image input streaming returns one complete result rather than incremental text.
 - **Generated image protocol can change**: Image output uses Gemini's undocumented GUI payload and full-size RPC. The server falls back to the validated preview when full-size RPC resolution is unavailable; edits, caching, and proxying are not implemented.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
@@ -296,7 +301,7 @@ the hard 10 MiB / three-redirect caps.
 ## Requirements
 
 - Python 3.8+
-- `curl_cffi` (`pip install -r requirements.txt`) — required for Gemini image input
+- `curl_cffi` (`pip install -r requirements.txt`) — required for Gemini image input and output
 - `httpx` (`pip install httpx`) — used for text streaming requests
 - Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
 

@@ -1,5 +1,5 @@
-import http.client
 import base64
+import http.client
 import json
 import threading
 import unittest
@@ -8,14 +8,23 @@ from urllib.parse import parse_qs
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.gemini import (
-    _batch_response_url, _build_image_payload, _build_payload, _generate_file_with_curl,
-    build_model_header, extract_response_text, generate_stream,
+    GeminiUpstreamError,
+    _batch_response_url,
+    _build_image_payload,
+    _build_model_headers,
+    _build_payload,
+    _generate_file_with_curl,
+    extract_response_text,
+    generate_image_structured,
+    generate_stream,
 )
 from gemini_web2api.generated_image import (
-    download_generated_image, extract_generation_result, resolve_generated_image_url,
+    download_generated_image,
+    extract_generation_result,
+    resolve_generated_image_url,
     validate_generated_image_url,
 )
-from gemini_web2api.multimodal import _get_page_tokens
+from gemini_web2api.multimodal import _get_page_tokens, fetch_image_bytes
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
 
@@ -107,16 +116,17 @@ class PayloadPersistenceTests(unittest.TestCase):
             61: [], 67: 0, 68: 1, 79: 6, 80: 1, 91: 0, 96: 0,
         })
 
-    def test_model_header_uses_public_routing_constants(self):
-        headers = build_model_header("cf41b0e0dd7d53e5", 1, 6)
+    def test_model_headers_include_discovered_routing_values(self):
+        headers = _build_model_headers("cf41b0e0dd7d53e5", 1, 6)
         self.assertIn('"cf41b0e0dd7d53e5"', headers["x-goog-ext-525001261-jspb"])
         self.assertEqual(headers["x-goog-ext-73010989-jspb"], "[0]")
         self.assertEqual(headers["x-goog-ext-73010990-jspb"], "[0,0,0]")
 
 
 class UpstreamErrorTests(unittest.TestCase):
-    def test_extract_response_text_rejects_structured_bard_error(self):
-        frame = [[
+    @staticmethod
+    def _structured_error():
+        return [[
             "wrb.fr", None, None, None, None,
             [13, None, [[
                 "type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",
@@ -124,12 +134,32 @@ class UpstreamErrorTests(unittest.TestCase):
             ]]],
         ]]
 
+    def test_extract_response_text_rejects_structured_bard_error(self):
         with self.assertRaisesRegex(RuntimeError, r"BardErrorInfo \[1100\]"):
-            extract_response_text(json.dumps(frame))
+            extract_response_text(json.dumps(self._structured_error()))
 
     def test_extract_response_text_still_rejects_legacy_bard_error(self):
         with self.assertRaisesRegex(RuntimeError, r"BardErrorInfo \[10\]"):
             extract_response_text("BardErrorInfo [10]")
+
+    @mock.patch("gemini_web2api.gemini._generate_image_raw_with_curl")
+    def test_image_generation_rejects_structured_bard_error(self, generate_raw):
+        generate_raw.return_value = json.dumps(self._structured_error())
+
+        with self.assertRaisesRegex(RuntimeError, r"BardErrorInfo \[1100\]"):
+            generate_image_structured("cat")
+
+    @mock.patch("gemini_web2api.gemini._get_httpx_client")
+    @mock.patch("gemini_web2api.gemini.HAS_HTTPX", True)
+    def test_stream_rejects_structured_bard_error_without_retry(self, get_client):
+        response = mock.MagicMock()
+        response.iter_text.return_value = [json.dumps(self._structured_error()) + "\n"]
+        get_client.return_value.stream.return_value.__enter__.return_value = response
+
+        with self.assertRaisesRegex(GeminiUpstreamError, r"BardErrorInfo \[1100\]"):
+            list(generate_stream("hello", 1, 4))
+
+        get_client.return_value.stream.assert_called_once()
 
 
 class GeneratedImageTests(unittest.TestCase):
@@ -266,6 +296,7 @@ class FileGenerationTests(unittest.TestCase):
         request_uuid = kwargs["headers"]["x-goog-ext-525005358-jspb"]
         self.assertEqual(request_uuid, f'["{sent_inner[59]}",1]')
         response.raise_for_status.assert_called_once()
+        response.close.assert_called_once()
         extract_response_text.assert_called_once_with("upstream body")
 
     @mock.patch("gemini_web2api.gemini.generate", return_value="one result")
@@ -294,6 +325,96 @@ class PageTokenTests(unittest.TestCase):
         self.assertEqual(request.full_url, "https://gemini.google.com/u/2/app")
         self.assertEqual(request.get_header("X-goog-authuser"), "2")
         self.assertEqual(request.get_header("Referer"), "https://gemini.google.com/u/2/app")
+
+    @mock.patch("gemini_web2api.multimodal.urllib.request.urlopen")
+    @mock.patch("gemini_web2api.multimodal.load_cookie", return_value=("", None))
+    def test_page_tokens_accept_previous_xsrf_key(self, _load_cookie, urlopen):
+        urlopen.return_value.read.return_value = b'{"thykhd":"legacy-token"}'
+
+        self.assertEqual(_get_page_tokens()["at"], "legacy-token")
+
+
+class RemoteImageFetchTests(unittest.TestCase):
+    @mock.patch("gemini_web2api.multimodal.CurlOpt")
+    @mock.patch("gemini_web2api.multimodal.curl_requests")
+    @mock.patch("gemini_web2api.multimodal.HAS_CURL_CFFI", True)
+    def test_rejects_non_public_literal_addresses(self, requests, _curl_opt):
+        for url in (
+            "https://127.0.0.1/image.png",
+            "https://10.0.0.1/image.png",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/image.png",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(fetch_image_bytes(url), b"")
+        requests.Session.assert_not_called()
+
+    @mock.patch("gemini_web2api.multimodal.CurlOpt")
+    @mock.patch("gemini_web2api.multimodal.socket.getaddrinfo")
+    @mock.patch("gemini_web2api.multimodal.curl_requests")
+    @mock.patch("gemini_web2api.multimodal.HAS_CURL_CFFI", True)
+    def test_rejects_redirect_to_private_address(self, requests, getaddrinfo, _curl_opt):
+        getaddrinfo.return_value = [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+        ]
+        session = requests.Session.return_value
+        response = session.get.return_value
+        response.status_code = 302
+        response.headers = {"Location": "https://127.0.0.1/private.png"}
+
+        self.assertEqual(fetch_image_bytes("https://example.com/image.png"), b"")
+        session.get.assert_called_once()
+        response.close.assert_called_once()
+        session.close.assert_called_once()
+
+    @mock.patch("gemini_web2api.multimodal.CurlOpt")
+    @mock.patch("gemini_web2api.multimodal.socket.getaddrinfo")
+    @mock.patch("gemini_web2api.multimodal.curl_requests")
+    @mock.patch("gemini_web2api.multimodal.HAS_CURL_CFFI", True)
+    def test_enforces_size_and_image_type(self, requests, getaddrinfo, _curl_opt):
+        getaddrinfo.return_value = [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+        ]
+        response = requests.Session.return_value.get.return_value
+        response.status_code = 200
+        response.headers = {
+            "Content-Type": "image/png",
+            "Content-Length": str(10 * 1024 * 1024 + 1),
+        }
+
+        self.assertEqual(fetch_image_bytes("https://example.com/image.png"), b"")
+
+        response.headers = {"Content-Type": "image/jpeg"}
+        response.iter_content.return_value = [b"\x89PNG\r\n\x1a\n"]
+        self.assertEqual(fetch_image_bytes("https://example.com/image.png"), b"")
+
+    @mock.patch("gemini_web2api.multimodal.CurlOpt")
+    @mock.patch("gemini_web2api.multimodal.socket.getaddrinfo")
+    @mock.patch("gemini_web2api.multimodal.curl_requests")
+    @mock.patch("gemini_web2api.multimodal.HAS_CURL_CFFI", True)
+    def test_fetches_bounded_public_image(self, requests, getaddrinfo, curl_opt):
+        getaddrinfo.return_value = [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+        ]
+        session = requests.Session.return_value
+        response = session.get.return_value
+        response.status_code = 200
+        response.headers = {"Content-Type": "image/png", "Content-Length": "8"}
+        response.iter_content.return_value = [b"\x89PNG\r\n\x1a\n"]
+
+        self.assertEqual(
+            fetch_image_bytes("https://example.com/image.png"),
+            b"\x89PNG\r\n\x1a\n",
+        )
+        self.assertFalse(session.get.call_args.kwargs["allow_redirects"])
+        session_options = requests.Session.call_args.kwargs
+        self.assertFalse(session_options["trust_env"])
+        self.assertEqual(
+            session_options["curl_options"][curl_opt.RESOLVE],
+            ["example.com:443:93.184.216.34"],
+        )
+        response.close.assert_called_once()
+        session.close.assert_called_once()
 
 
 class MessageParsingTests(unittest.TestCase):
@@ -441,6 +562,47 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(chunks[0]["choices"][0]["delta"], {"role": "assistant"})
         self.assertEqual(chunks[1]["choices"][0]["delta"], {"content": "hel"})
         self.assertEqual(chunks[2]["choices"][0]["delta"], {"content": "lo"})
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_chat_stream_returns_json_error_before_sse(self, generate_stream):
+        def rejected():
+            raise GeminiUpstreamError("Gemini rejected request")
+            yield  # pragma: no cover
+
+        generate_stream.return_value = rejected()
+        status, headers, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(status, 502)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertIn("Gemini rejected request", json.loads(body)["error"]["message"])
+
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_chat_stream_emits_error_after_sse_starts(self, generate_stream):
+        def rejected_after_delta():
+            yield "partial"
+            raise GeminiUpstreamError("late rejection")
+
+        generate_stream.return_value = rejected_after_delta()
+        status, headers, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        self.assertIn('"type": "upstream_error"', body)
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
     @mock.patch("gemini_web2api.server.generate", return_value="chunked ok")
@@ -599,6 +761,38 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "text/event-stream")
         self.assertIn('"text": "streamed"', body)
 
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_google_stream_returns_json_error_before_sse(self, generate_stream):
+        def rejected():
+            raise GeminiUpstreamError("Gemini rejected request")
+            yield  # pragma: no cover
+
+        generate_stream.return_value = rejected()
+        status, headers, body = self.post_json(
+            "/v1beta/models/gemini-3.6-flash:streamGenerateContent",
+            {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
+        )
+
+        self.assertEqual(status, 502)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertIn("Gemini rejected request", json.loads(body)["error"]["message"])
+
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_google_stream_emits_error_after_sse_starts(self, generate_stream):
+        def rejected_after_delta():
+            yield "partial"
+            raise GeminiUpstreamError("late rejection")
+
+        generate_stream.return_value = rejected_after_delta()
+        status, headers, body = self.post_json(
+            "/v1beta/models/gemini-3.6-flash:streamGenerateContent",
+            {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        self.assertIn('"status": "UNAVAILABLE"', body)
+
     @mock.patch("gemini_web2api.server.resolve_generated_image_url", return_value="https://lh3.googleusercontent.com/rd-gg-dl/a")
     @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
     @mock.patch("gemini_web2api.server.generate_image_structured")
@@ -608,7 +802,10 @@ class StreamingEndpointTests(unittest.TestCase):
         image = GeneratedImage("https://lh3.googleusercontent.com/a")
         generate_image_structured.return_value = GenerationResult(images=[image])
 
-        status, _, body = self.post_json("/v1/images/generations", {"prompt": "a cat"})
+        status, _, body = self.post_json(
+            "/v1/images/generations",
+            {"prompt": "a cat", "model": "gpt-image-1", "user": "client-id"},
+        )
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["data"][0]["b64_json"], "iVBORw0KGgo=")
         download.assert_called_once_with(image.url)
@@ -641,13 +838,29 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(image_events[-1][1]["item"]["result"], "iVBORw0KGgo=")
         self.assertEqual(events[-1][0], "response.completed")
 
+    def test_responses_image_generation_rejects_image_input(self):
+        image_data = base64.b64encode(b"fake png").decode()
+        status, _, body = self.post_json("/v1/responses", {
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{image_data}",
+                }],
+            }],
+            "tools": [{"type": "image_generation"}],
+        })
+
+        self.assertEqual(status, 400)
+        self.assertIn("not supported", json.loads(body)["error"]["message"])
+
     @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
     @mock.patch("gemini_web2api.server.generate_image_structured")
     @mock.patch("gemini_web2api.server.download_generated_image", return_value=(b"\x89PNG\r\n\x1a\n", "image/png"))
     def test_responses_image_generation_non_stream_returns_completed_item(self, _download, generate_image_structured, _full_size):
         from gemini_web2api.generated_image import GeneratedImage, GenerationResult
         generate_image_structured.return_value = GenerationResult(
-            text="caption", images=[GeneratedImage("https://lh3.googleusercontent.com/a")]
+            images=[GeneratedImage("https://lh3.googleusercontent.com/a")]
         )
 
         status, headers, body = self.post_json("/v1/responses", {
@@ -659,7 +872,8 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "application/json")
         self.assertEqual(response["object"], "response")
         self.assertEqual(response["status"], "completed")
-        image_item = next(item for item in response["output"] if item["type"] == "image_generation_call")
+        self.assertEqual([item["type"] for item in response["output"]], ["image_generation_call"])
+        image_item = response["output"][0]
         self.assertTrue(image_item["id"].startswith("imggen_"))
         self.assertEqual(image_item["status"], "completed")
         self.assertEqual(image_item["result"], "iVBORw0KGgo=")

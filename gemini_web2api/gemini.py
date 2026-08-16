@@ -1,14 +1,16 @@
 """Gemini StreamGenerate protocol implementation with httpx streaming."""
-import json
-import time
-import uuid
-import re
-import urllib.request
-import urllib.parse
-import ssl
-import os
+from __future__ import annotations
+
 import hashlib
+import json
+import os
+import re
 import secrets
+import ssl
+import time
+import urllib.parse
+import urllib.request
+import uuid
 
 try:
     import httpx
@@ -29,6 +31,16 @@ from .generated_image import GenerationResult, extract_generation_result
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
+
+
+class GeminiUpstreamError(RuntimeError):
+    """A non-retryable rejection returned by Gemini's application protocol."""
+
+
+def _upstream_error(code: int) -> GeminiUpstreamError:
+    return GeminiUpstreamError(
+        f"Gemini upstream rejected request: BardErrorInfo [{code}]"
+    )
 
 
 def log(msg: str):
@@ -95,8 +107,7 @@ def _account_prefix() -> str:
 
 
 _IMAGE_MODEL_HEADER_KEY = "x-goog-ext-525001261-jspb"
-# Current Flash Lite route from Gemini Web's page-model list. An
-# account-specific discovered route remains preferred when available.
+# Known image-capable route used only when the account page does not expose one.
 _IMAGE_MODEL_FALLBACK = ("8c46e95b1a07cecc", "2", 6)
 
 
@@ -121,8 +132,9 @@ def _build_headers(request_uuid: str = None) -> dict:
     return headers
 
 
-def build_model_header(model_id: str, capacity_tail: str | int, model_category: int) -> dict:
-    """Build the Gemini Web model-selection headers without session values."""
+def _build_model_headers(model_id: str, capacity_tail: str | int,
+                         model_category: int) -> dict:
+    """Build Gemini Web model-selection headers without session values."""
     return {
         _IMAGE_MODEL_HEADER_KEY: (
             f'[1,null,null,null,"{model_id}",null,null,0,[4,5,6,8],null,null,'
@@ -142,7 +154,7 @@ def _image_model_headers(page_tokens: dict, session_uuid: str = None) -> dict:
         model_id, capacity_tail, category = discovered
     else:
         model_id, capacity_tail, category = _IMAGE_MODEL_FALLBACK
-    headers = build_model_header(str(model_id), str(capacity_tail), int(category))
+    headers = _build_model_headers(str(model_id), str(capacity_tail), int(category))
     model_header = json.loads(headers[_IMAGE_MODEL_HEADER_KEY])
     model_header.extend([1, session_uuid or str(uuid.uuid4()).upper()])
     headers[_IMAGE_MODEL_HEADER_KEY] = json.dumps(model_header)
@@ -342,15 +354,41 @@ def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
     bard_error_code = _bard_error_code(raw)
     if bard_error_code is not None:
-        raise RuntimeError(
-            f"Gemini upstream rejected request: BardErrorInfo [{bard_error_code}]"
-        )
+        raise _upstream_error(bard_error_code)
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
             if len(t) > len(last_text):
                 last_text = t
     return clean_text(last_text)
+
+
+def _curl_post_with_retry(url: str, request_args: dict, operation: str) -> str:
+    """POST with the configured retry policy and always release the response."""
+    last_error = None
+    attempts = max(1, int(CONFIG["retry_attempts"]))
+    for attempt in range(attempts):
+        response = None
+        try:
+            response = curl_requests.post(url, **request_args)
+            response.raise_for_status()
+            return response.text
+        except GeminiUpstreamError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                log(
+                    f"{operation} retry {attempt + 1}/{attempts}: "
+                    f"{exc}"
+                )
+                time.sleep(CONFIG["retry_delay_sec"])
+        finally:
+            if response is not None:
+                close = getattr(response, "close", None)
+                if close:
+                    close()
+    raise last_error
 
 
 def _generate_file_raw_with_curl(prompt: str, model_id: int, think_mode: int, file_refs: list,
@@ -383,18 +421,7 @@ def _generate_file_raw_with_curl(prompt: str, model_id: int, think_mode: int, fi
     if CONFIG.get("proxy"):
         request_args["proxy"] = CONFIG["proxy"]
 
-    last_err = None
-    for attempt in range(CONFIG["retry_attempts"]):
-        try:
-            response = curl_requests.post(url, **request_args)
-            response.raise_for_status()
-            return response.text
-        except Exception as e:
-            last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"File generation retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
-    raise last_err
+    return _curl_post_with_retry(url, request_args, "File generation")
 
 
 def _generate_image_raw_with_curl(prompt: str) -> str:
@@ -419,23 +446,18 @@ def _generate_image_raw_with_curl(prompt: str) -> str:
     if CONFIG.get("proxy"):
         request_args["proxy"] = CONFIG["proxy"]
 
-    last_err = None
-    for attempt in range(CONFIG["retry_attempts"]):
-        try:
-            response = curl_requests.post(_get_url(page_tokens.get("f_sid")), **request_args)
-            response.raise_for_status()
-            return response.text
-        except Exception as exc:
-            last_err = exc
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Image generation retry {attempt+1}/{CONFIG['retry_attempts']}: {exc}")
-                time.sleep(CONFIG["retry_delay_sec"])
-    raise last_err
+    return _curl_post_with_retry(
+        _get_url(page_tokens.get("f_sid")), request_args, "Image generation"
+    )
 
 
 def generate_image_structured(prompt: str) -> GenerationResult:
     """Generate an image with the GUI-specific payload and return rich metadata."""
-    return extract_generation_result(_generate_image_raw_with_curl(prompt), clean_text)
+    raw = _generate_image_raw_with_curl(prompt)
+    bard_error_code = _bard_error_code(raw)
+    if bard_error_code is not None:
+        raise _upstream_error(bard_error_code)
+    return extract_generation_result(raw, clean_text)
 
 
 def _batch_response_url(raw: str) -> str:
@@ -560,14 +582,6 @@ def _generate_raw(prompt: str, model_id: int, think_mode: int, file_refs: list =
     raise last_err
 
 
-def generate_structured(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
-                        extra_fields: dict = None) -> GenerationResult:
-    """Return text plus generated-image metadata while leaving ``generate`` unchanged."""
-    return extract_generation_result(
-        _generate_raw(prompt, model_id, think_mode, file_refs, extra_fields), clean_text
-    )
-
-
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
     return extract_response_text(_generate_raw(prompt, model_id, think_mode, file_refs, extra_fields))
@@ -605,14 +619,11 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
-                    if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                        if bard_err:
-                            raise RuntimeError(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-                            )
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
+                        bard_error_code = _bard_error_code(line)
+                        if bard_error_code is not None:
+                            raise _upstream_error(bard_error_code)
                         for t in _extract_texts_from_line(line):
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
@@ -623,6 +634,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if delta:
                                 yield delta
             return
+        except GeminiUpstreamError:
+            raise
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:

@@ -1,21 +1,37 @@
 """Multimodal: Scotty resumable upload for Gemini image input."""
-import json
-import base64
-import urllib.request
-import urllib.parse
-import time
-import ssl
+import ipaddress
 import re
+import socket
+import time
+import urllib.parse
+import urllib.request
 from urllib.parse import urlparse
 
+try:
+    from curl_cffi import CurlOpt
+except ImportError:  # pragma: no cover - exercised when image support is absent
+    CurlOpt = None
+
 from .config import CONFIG
-from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
+from .gemini import (
+    HAS_CURL_CFFI,
+    _account_prefix,
+    _get_ssl_ctx,
+    curl_requests,
+    load_cookie,
+    log,
+    make_sapisidhash,
+)
+
+_MAX_REMOTE_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_REMOTE_IMAGE_REDIRECTS = 3
+_REDIRECT_STATUS = {301, 302, 303, 307, 308}
 
 
 def _get_page_tokens() -> dict:
     """Fetch WIZ_global_data tokens from the configured Gemini account page."""
     auth_user = CONFIG.get("auth_user")
-    account_prefix = "" if auth_user is None or auth_user == "" else f"/u/{auth_user}"
+    account_prefix = _account_prefix()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": f"https://gemini.google.com{account_prefix}/app",
@@ -42,21 +58,30 @@ def _get_page_tokens() -> dict:
             resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
         html = resp.read().decode()
         tokens = {}
-        for key, pattern in [
-            ("push_id", r'"qKIAYe":"([^"]+)"'),
-            ("pctx", r'"Ylro7b":"([^"]+)"'),
+        patterns = {
+            "push_id": (r'"qKIAYe":"([^"]+)"',),
+            "pctx": (r'"Ylro7b":"([^"]+)"',),
             # These values bind file-bearing StreamGenerate requests to the
-            # currently loaded Gemini Web session.
-            ("f_sid", r'"FdrFJe":\s*"([^"]+)"'),
-            ("at", r'"SNlM0e":\s*"([^"]+)"'),
-            # The account page carries the currently available image model as
-            # an internal ID, capacity tail, and model category.  These are
-            # model-routing metadata, not session credentials.
-            ("image_model", r'\["(cf[a-f0-9]{14})",\s*(\d+),\s*(6)\]'),
-        ]:
-            m = re.search(pattern, html)
-            if m:
-                tokens[key] = (m.groups() if key == "image_model" else m.group(1))
+            # currently loaded Gemini Web session. Keep the previous XSRF key
+            # as a fallback because page rollouts are not always simultaneous.
+            "f_sid": (r'"FdrFJe":\s*"([^"]+)"',),
+            "at": (
+                r'"SNlM0e":\s*"([^"]+)"',
+                r'"thykhd":\s*"([^"]+)"',
+            ),
+            # The account page carries the available image model as an
+            # internal ID, capacity tail, and model category.
+            "image_model": (r'\["(cf[a-f0-9]{14})",\s*(\d+),\s*(6)\]',),
+        }
+        for key, candidates in patterns.items():
+            match = None
+            for pattern in candidates:
+                match = re.search(pattern, html)
+                if match:
+                    break
+            if match:
+                tokens[key] = (match.groups() if key == "image_model"
+                               else match.group(1))
         return tokens
     except Exception as e:
         log(f"Page token fetch failed: {e}")
@@ -172,24 +197,108 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
     return file_ref
 
 
-def fetch_image_bytes(url: str) -> bytes:
-    """Fetch image from URL."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        log(f"Image fetch skipped for unsupported URL scheme: {parsed.scheme or 'none'}")
-        return b""
+def _validate_remote_image_url(url: str):
+    """Return the URL, host, and one validated public address for a request hop."""
+    if not isinstance(url, str) or not url or len(url) > 8192:
+        raise ValueError("invalid remote image URL")
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        proxy = CONFIG.get("proxy")
-        if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
-            )
-            resp = opener.open(req, timeout=30)
-        else:
-            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-        return resp.read()
-    except Exception as e:
-        log(f"Image fetch failed: {e}")
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid remote image URL") from exc
+    host = parsed.hostname
+    if (parsed.scheme != "https" or not host or parsed.username is not None
+            or parsed.password is not None or port not in (None, 443)):
+        raise ValueError("remote image URL is not allowed")
+
+    try:
+        addresses = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            addresses = {
+                ipaddress.ip_address(item[4][0])
+                for item in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            }
+        except (OSError, ValueError) as exc:
+            raise ValueError("remote image host could not be resolved") from exc
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ValueError("remote image host is not public")
+    address = sorted(addresses, key=lambda item: (item.version, str(item)))[0]
+    return url, host, address
+
+
+def fetch_image_bytes(url: str) -> bytes:
+    """Fetch one bounded public HTTPS raster image without implicit redirects."""
+    if not HAS_CURL_CFFI or CurlOpt is None:
+        log("Image fetch failed: curl_cffi is required for remote image input")
         return b""
+    current = url
+    try:
+        for redirect_count in range(_MAX_REMOTE_IMAGE_REDIRECTS + 1):
+            current, host, address = _validate_remote_image_url(current)
+            address_text = str(address)
+            if address.version == 6:
+                address_text = f"[{address_text}]"
+            resolve_entry = f"{host}:443:{address_text}"
+            # Use a direct, pinned connection. A configured or environment
+            # proxy could resolve the hostname again and bypass this check.
+            session = curl_requests.Session(
+                curl_options={CurlOpt.RESOLVE: [resolve_entry]},
+                trust_env=False,
+            )
+            response = None
+            try:
+                response = session.get(
+                    current,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=CONFIG["request_timeout_sec"],
+                    impersonate="chrome",
+                    allow_redirects=False,
+                    stream=True,
+                )
+                if response.status_code in _REDIRECT_STATUS:
+                    if redirect_count >= _MAX_REMOTE_IMAGE_REDIRECTS:
+                        raise ValueError("remote image exceeded redirect limit")
+                    location = response.headers.get("Location")
+                    if not location:
+                        raise ValueError("remote image redirect has no location")
+                    current = urllib.parse.urljoin(current, location)
+                    continue
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"remote image fetch failed: HTTP {response.status_code}"
+                    )
+                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                if not content_type.startswith("image/"):
+                    raise ValueError("remote image response is not an image")
+                content_length = response.headers.get("Content-Length")
+                if content_length is not None:
+                    try:
+                        length = int(content_length)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("invalid remote image content length") from exc
+                    if length < 0 or length > _MAX_REMOTE_IMAGE_BYTES:
+                        raise ValueError("remote image exceeds size limit")
+
+                body = bytearray()
+                for chunk in response.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    body.extend(chunk)
+                    if len(body) > _MAX_REMOTE_IMAGE_BYTES:
+                        raise ValueError("remote image exceeds size limit")
+                data = bytes(body)
+                detected_type = detect_image_mime(data, "")
+                declared_type = "image/jpeg" if content_type == "image/jpg" else content_type
+                if not detected_type or declared_type != detected_type:
+                    raise ValueError("remote image content type does not match bytes")
+                return data
+            finally:
+                if response is not None:
+                    close = getattr(response, "close", None)
+                    if close:
+                        close()
+                session.close()
+    except Exception as exc:
+        log(f"Image fetch failed: {exc}")
+    return b""

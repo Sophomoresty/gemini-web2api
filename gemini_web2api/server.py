@@ -1,25 +1,51 @@
 """HTTP server: OpenAI-compatible API endpoints."""
+import base64
+import itertools
 import json
+import re
 import time
 import uuid
-import re
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-from .config import CONFIG
-from .models import MODELS, resolve_model
-from .gemini import (generate, generate_stream, generate_structured,
-                     generate_image_structured, get_full_size_image, log)
-from .generated_image import download_generated_image, resolve_generated_image_url
-from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
-from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
+from .config import CONFIG
+from .gemini import (
+    generate,
+    generate_image_structured,
+    generate_stream,
+    get_full_size_image,
+    log,
+)
+from .generated_image import download_generated_image, resolve_generated_image_url
+from .models import MODELS, resolve_model
+from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
+from .tools import (
+    google_contents_to_prompt,
+    messages_to_prompt,
+    parse_google_function_calls,
+    parse_tool_calls,
+)
 
 
 def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
     c = len(text or "") // 4
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _generated_image_output(prompt: str, response_format: str):
+    """Generate one image and return its optional text plus OpenAI output data."""
+    result = generate_image_structured(prompt)
+    if not result.images:
+        raise RuntimeError("Gemini returned no generated image metadata")
+    source_url = get_full_size_image(result.images[0]) or result.images[0].url
+    if response_format == "url":
+        data = {"url": resolve_generated_image_url(source_url)}
+    else:
+        image_bytes, _mime = download_generated_image(source_url)
+        data = {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
+    return result.text, data
 
 
 def _upload_images(images: list) -> list:
@@ -186,9 +212,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
         unsupported = [name for name in ("stream", "size", "quality", "style") if name in req]
-        unexpected = set(req) - {"prompt", "model", "n", "response_format"}
         prompt = req.get("prompt")
-        if unsupported or unexpected or not isinstance(prompt, str) or not prompt.strip():
+        if unsupported or not isinstance(prompt, str) or not prompt.strip():
             self.send_json({"error": {"message": "invalid image generation request"}}, 400)
             return
         if "n" in req and (not isinstance(req["n"], int) or isinstance(req["n"], bool) or req["n"] != 1):
@@ -198,32 +223,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if response_format not in ("b64_json", "url"):
             self.send_json({"error": {"message": "response_format must be b64_json or url"}}, 400)
             return
-        model_value = req.get("model", CONFIG["default_model"])
-        if not isinstance(model_value, str):
+        model_value = req.get("model")
+        if model_value is not None and not isinstance(model_value, str):
             self.send_json({"error": {"message": "invalid model"}}, 400)
             return
-        model_name, model_id, think_mode, err, extra_fields = resolve_model(model_value)
-        if err:
-            self.send_json({"error": {"message": err}}, 400)
-            return
         try:
-            # Image generation uses Gemini Web's dedicated GUI request shape,
-            # rather than the normal model-selected text route.
-            result = generate_image_structured(prompt)
-            if not result.images:
-                self.send_json({"error": {"message": "Gemini returned no generated image metadata"}}, 502)
-                return
-            image = result.images[0]
-            # Prefer c8o8Fe's full-size URL for both formats.  A missing or
-            # changed RPC returns None, in which case the preview remains the
-            # documented fallback; URL responses are always fully resolved.
-            source_url = get_full_size_image(image) or image.url
-            if response_format == "url":
-                data = {"url": resolve_generated_image_url(source_url)}
-            else:
-                import base64
-                image_bytes, _mime = download_generated_image(source_url)
-                data = {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
+            # Gemini Web selects its image route independently of text models.
+            _text, data = _generated_image_output(prompt, response_format)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -258,18 +264,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         if stream and (not tools or tool_choice == "none"):
-            # Image streaming uses a one-result fallback. Resolve it before
-            # committing HTTP 200/SSE headers so upstream failures remain a
-            # normal JSON 502 instead of a silently truncated stream.
-            file_stream_text = None
-            if file_refs:
-                try:
-                    file_stream_text = generate(
-                        prompt, model_id, think_mode, file_refs, extra_fields
-                    )
-                except Exception as e:
-                    self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-                    return
+            # Prime the iterator before committing HTTP 200/SSE headers so an
+            # immediate upstream rejection remains a normal JSON 502.
+            try:
+                deltas = iter(
+                    [generate(prompt, model_id, think_mode, file_refs, extra_fields)]
+                    if file_refs else
+                    generate_stream(prompt, model_id, think_mode, None, extra_fields)
+                )
+                first_delta = next(deltas, None)
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
             try:
                 self._start_sse()
                 first_chunk = {
@@ -285,9 +291,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
-                deltas = ([file_stream_text] if file_refs else
-                          generate_stream(prompt, model_id, think_mode, None, extra_fields))
-                for delta in deltas:
+                for delta in itertools.chain(
+                    [first_delta] if first_delta else [], deltas
+                ):
                     if not delta:
                         continue
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
@@ -303,6 +309,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+                error = {"error": {"message": f"upstream error: {e}",
+                                   "type": "upstream_error"}}
+                try:
+                    self.wfile.write(f"data: {json.dumps(error)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             return
 
         try:
@@ -405,23 +419,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        if image_generation_requested and images:
+            self.send_json({
+                "error": {"message": "image generation with input images is not supported"}
+            }, 400)
+            return
+
         generated_image_call = None
         try:
             file_refs = _upload_images(images)
             if image_generation_requested:
-                import base64
-                result = generate_image_structured(prompt)
-                text = result.text
-                if not result.images:
-                    raise RuntimeError("Gemini returned no generated image metadata")
-                image_bytes, _mime = download_generated_image(
-                    get_full_size_image(result.images[0]) or result.images[0].url
-                )
+                text, image_data = _generated_image_output(prompt, "b64_json")
                 generated_image_call = {
                     "type": "image_generation_call",
                     "id": f"imggen_{uuid.uuid4().hex[:12]}",
                     "status": "completed",
-                    "result": base64.b64encode(image_bytes).decode("ascii"),
+                    "result": image_data["b64_json"],
                 }
             else:
                 text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
@@ -440,7 +453,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             for tc in tool_calls:
                 output.append({"type": "function_call", "id": tc["id"], "call_id": tc["id"],
                                "name": tc["function"]["name"], "arguments": tc["function"]["arguments"], "status": "completed"})
-        if text or not tool_calls:
+        if text or (not tool_calls and not generated_image_call):
             output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
         if generated_image_call:
@@ -628,23 +641,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
 
         if stream and not has_tools:
-            # As above, resolve the image fallback before sending SSE headers
-            # so file-generation failures can be reported as JSON errors.
-            file_stream_text = None
-            if file_refs:
-                try:
-                    file_stream_text = generate(
-                        prompt, model_id, think_mode, file_refs, extra_fields
-                    )
-                except Exception as e:
-                    self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-                    return
+            try:
+                deltas = iter(
+                    [generate(prompt, model_id, think_mode, file_refs, extra_fields)]
+                    if file_refs else
+                    generate_stream(prompt, model_id, think_mode, None, extra_fields)
+                )
+                first_delta = next(deltas, None)
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
             try:
                 self._start_sse()
                 full_text = ""
-                deltas = ([file_stream_text] if file_refs else
-                          generate_stream(prompt, model_id, think_mode, None, extra_fields))
-                for delta in deltas:
+                for delta in itertools.chain(
+                    [first_delta] if first_delta else [], deltas
+                ):
                     if not delta:
                         continue
                     full_text += delta
@@ -669,6 +681,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Google stream error: {e}")
+                error = {"error": {"code": 502, "message": f"upstream error: {e}",
+                                   "status": "UNAVAILABLE"}}
+                try:
+                    self.wfile.write(f"data: {json.dumps(error)}\n\n".encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             return
 
         try:

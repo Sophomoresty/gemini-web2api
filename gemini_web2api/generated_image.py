@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -91,10 +90,6 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
     ``"8"``), whose entries live at ``[0]``.  Preview URL, alt text, and image
     ID are respectively ``[0][3][3]``, ``[0][3][2]``, and ``[1][0]``.
     """
-    bard_error = re.search(r"BardErrorInfo\s*\[(\d+)\]", raw)
-    if bard_error:
-        raise RuntimeError("Gemini upstream rejected request: BardErrorInfo [%s]" % bard_error.group(1))
-
     text = ""
     images: list[GeneratedImage] = []
     seen = set()
@@ -155,10 +150,10 @@ def _validated_https_url(url: str, allowed_hosts: set[str]) -> str:
         raise ValueError("generated image URL is not allowed")
     try:
         ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
         raise ValueError("generated image URL is not allowed")
-    except ValueError as exc:
-        if str(exc) == "generated image URL is not allowed":
-            raise
     if host not in allowed_hosts:
         raise ValueError("generated image URL is not allowed")
     return url
@@ -191,7 +186,7 @@ def _image_mime(data: bytes) -> str:
 def _limits() -> tuple[int, int]:
     configured_bytes = CONFIG.get("generated_image_max_bytes", MAX_GENERATED_IMAGE_BYTES)
     configured_redirects = CONFIG.get("generated_image_max_redirects", MAX_GENERATED_IMAGE_REDIRECTS)
-    max_bytes = (min(configured_bytes, MAX_GENERATED_IMAGE_BYTES)
+    max_bytes = (max(1, min(configured_bytes, MAX_GENERATED_IMAGE_BYTES))
                  if isinstance(configured_bytes, int) and not isinstance(configured_bytes, bool)
                  else MAX_GENERATED_IMAGE_BYTES)
     max_redirects = (max(0, min(configured_redirects, MAX_GENERATED_IMAGE_REDIRECTS))
@@ -219,19 +214,27 @@ def _request_args(stream: bool) -> dict:
     return args
 
 
+def _content_length(headers) -> int | None:
+    value = headers.get("Content-Length")
+    if value is None:
+        return None
+    try:
+        length = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid generated image content length") from exc
+    if length < 0:
+        raise ValueError("invalid generated image content length")
+    return length
+
+
 def _read_mediator_url(response) -> str:
     content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
     if content_type != "text/plain":
         raise ValueError("generated image mediator did not return text/plain")
-    content_length = response.headers.get("Content-Length")
-    if content_length:
-        try:
-            if int(content_length) > MAX_GENERATED_IMAGE_URL_TEXT_BYTES:
-                raise ValueError("generated image mediator response is too large")
-        except ValueError as exc:
-            if str(exc) == "generated image mediator response is too large":
-                raise
-            raise ValueError("invalid generated image mediator content length") from exc
+    content_length = _content_length(response.headers)
+    if (content_length is not None
+            and content_length > MAX_GENERATED_IMAGE_URL_TEXT_BYTES):
+        raise ValueError("generated image mediator response is too large")
     body = bytearray()
     for chunk in response.iter_content(chunk_size=1024):
         if not chunk:
@@ -299,7 +302,9 @@ def resolve_generated_image_url(url: str) -> str:
                 redirects += 1
                 continue
             if response.status_code != 200:
-                raise RuntimeError("generated image download failed: HTTP %s" % response.status_code)
+                raise RuntimeError(
+                    f"generated image download failed: HTTP {response.status_code}"
+                )
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             if content_type.startswith("image/"):
                 if source_is_mediator:
@@ -335,16 +340,12 @@ def download_generated_image(url: str) -> tuple[bytes, str]:
                 current = validate_generated_image_url(urljoin(current, location))
                 continue
             if response.status_code != 200:
-                raise RuntimeError("generated image download failed: HTTP %s" % response.status_code)
-            content_length = response.headers.get("Content-Length")
-            if content_length:
-                try:
-                    if int(content_length) > max_bytes:
-                        raise ValueError("generated image exceeds 10 MiB")
-                except ValueError as exc:
-                    if str(exc) == "generated image exceeds 10 MiB":
-                        raise
-                    raise ValueError("invalid generated image content length") from exc
+                raise RuntimeError(
+                    f"generated image download failed: HTTP {response.status_code}"
+                )
+            content_length = _content_length(response.headers)
+            if content_length is not None and content_length > max_bytes:
+                raise ValueError("generated image exceeds configured size limit")
             chunks = []
             total = 0
             for chunk in response.iter_content(chunk_size=65536):
@@ -352,7 +353,7 @@ def download_generated_image(url: str) -> tuple[bytes, str]:
                     continue
                 total += len(chunk)
                 if total > max_bytes:
-                    raise ValueError("generated image exceeds 10 MiB")
+                    raise ValueError("generated image exceeds configured size limit")
                 chunks.append(chunk)
             data = b"".join(chunks)
             mime = _image_mime(data)
