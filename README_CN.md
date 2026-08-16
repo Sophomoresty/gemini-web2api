@@ -253,6 +253,10 @@ resp = client.chat.completions.create(
 `{ "type": "image_generation" }`，会在保留文本输出的同时追加一个带 base64 结果的
 `image_generation_call`。
 
+Chat Completions 会识别最新用户消息中类似 `generate an image of ...` 的明确图片生成请求，
+并使用同一图片生成路径。流式客户端即使携带函数工具或在对话历史中保留旧图片附件，也会
+收到浏览器可访问的 Markdown 图片 URL。历史附件不会被当作图片编辑输入。
+
 base64 输出仅使用 Chrome 模拟下载 HTTPS 的精确或子域
 `googleusercontent.com` 地址：最多 3 次重定向、10 MiB，且 PNG/JPEG/WebP 文件头必须
 与 HTTP Content-Type 一致。配置项 `generated_image_max_bytes` 与

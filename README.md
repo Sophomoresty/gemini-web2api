@@ -283,6 +283,11 @@ mediators are resolved without downloading the image bytes).
 also recognizes `{ "type": "image_generation" }` in `tools` and emits one
 `image_generation_call` containing base64 output alongside any generated text.
 
+Chat Completions routes explicit requests such as `generate an image of ...` in the latest
+user turn through the same image-generation path. It returns a browser-accessible Markdown
+image URL, including for streaming clients that send function tools or retain older image
+attachments in conversation history. Historical attachments are not treated as image edits.
+
 For base64 output, the server downloads only HTTPS exact/subdomain
 `googleusercontent.com` URLs with Chrome impersonation, at most three redirects and 10 MiB.
 PNG, JPEG, and WebP bytes and their HTTP content type must agree.
