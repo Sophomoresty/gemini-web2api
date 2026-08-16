@@ -9,7 +9,7 @@ from urllib.parse import parse_qs
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.gemini import (
     _batch_response_url, _build_image_payload, _build_payload, _generate_file_with_curl,
-    build_model_header, generate_stream,
+    build_model_header, extract_response_text, generate_stream,
 )
 from gemini_web2api.generated_image import (
     download_generated_image, extract_generation_result, resolve_generated_image_url,
@@ -112,6 +112,24 @@ class PayloadPersistenceTests(unittest.TestCase):
         self.assertIn('"cf41b0e0dd7d53e5"', headers["x-goog-ext-525001261-jspb"])
         self.assertEqual(headers["x-goog-ext-73010989-jspb"], "[0]")
         self.assertEqual(headers["x-goog-ext-73010990-jspb"], "[0,0,0]")
+
+
+class UpstreamErrorTests(unittest.TestCase):
+    def test_extract_response_text_rejects_structured_bard_error(self):
+        frame = [[
+            "wrb.fr", None, None, None, None,
+            [13, None, [[
+                "type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",
+                [1100],
+            ]]],
+        ]]
+
+        with self.assertRaisesRegex(RuntimeError, r"BardErrorInfo \[1100\]"):
+            extract_response_text(json.dumps(frame))
+
+    def test_extract_response_text_still_rejects_legacy_bard_error(self):
+        with self.assertRaisesRegex(RuntimeError, r"BardErrorInfo \[10\]"):
+            extract_response_text("BardErrorInfo [10]")
 
 
 class GeneratedImageTests(unittest.TestCase):

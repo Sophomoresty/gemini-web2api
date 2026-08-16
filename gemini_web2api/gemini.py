@@ -298,11 +298,53 @@ def _extract_texts_from_line(line: str) -> list:
         return []
 
 
+def _bard_error_code(raw: str) -> int | None:
+    """Return a BardErrorInfo code from legacy text or structured wrb.fr frames."""
+    legacy = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
+    if legacy:
+        return int(legacy.group(1))
+
+    def find(value):
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                if (isinstance(item, str) and item.endswith(".BardErrorInfo")
+                        and index + 1 < len(value)):
+                    details = value[index + 1]
+                    if (isinstance(details, list) and details
+                            and isinstance(details[0], int)):
+                        return details[0]
+                code = find(item)
+                if code is not None:
+                    return code
+        elif isinstance(value, dict):
+            for item in value.values():
+                code = find(item)
+                if code is not None:
+                    return code
+        elif isinstance(value, str) and value[:1] in ("[", "{"):
+            try:
+                return find(json.loads(value))
+            except json.JSONDecodeError:
+                pass
+        return None
+
+    for line in raw.splitlines():
+        try:
+            code = find(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+        if code is not None:
+            return code
+    return None
+
+
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
-    bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
-    if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+    bard_error_code = _bard_error_code(raw)
+    if bard_error_code is not None:
+        raise RuntimeError(
+            f"Gemini upstream rejected request: BardErrorInfo [{bard_error_code}]"
+        )
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
