@@ -991,18 +991,27 @@ function buildPayload(prompt, modelId, thinkMode, config) {
  * 参数说明:
  * - bl (build label): Gemini 前端构建版本标识，用于 API 版本控制
  * - hl (host language): 界面语言，固定为 en（英语）
- * - _reqid: 请求 ID，使用时间戳的后 6 位数字
+ * - _reqid: 请求 ID，进程内递增计数器（模拟真实浏览器行为，每次 +100000）
  * - rt: 请求类型，c 表示普通聊天请求
  * 
  * @param {Object} config - 请求级配置对象
  * @returns {string} 完整的请求 URL
  */
+// 浏览器会话级 RPC 计数器。真实 Gemini 网页在同一页面会话中，每次请求的
+// _reqid 都是递增的（+100000）。之前用时间戳取后 6 位，会让同一秒内的并发
+// 请求（例如排程任务触发的同时用户正在聊天）发出完全相同的请求 ID。
+var REQID_NEXT = 10000 + Math.floor(Math.random() * 90000);
+
+function nextReqid() {
+  REQID_NEXT += 100000;
+  return REQID_NEXT;
+}
+
 function buildUrl(config) {
   // 获取多账户 URL 前缀
   var prefix = getAccountPrefix(config);
-  // 生成请求 ID（使用时间戳的后 6 位数字）
-  // 例如 timestamp() = 1753872000 → reqid = 872000
-  var reqid = timestamp() % 1000000;
+  // 生成请求 ID（进程内唯一、递增）
+  var reqid = nextReqid();
   // 拼接完整 URL
   return 'https://gemini.google.com' + prefix +
     '/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate' +
@@ -1283,32 +1292,122 @@ function cleanGeminiText(text, strip) {
 }
 
 /**
- * 从 Gemini API 原始响应中提取最终文本
+ * 解析一行响应中的所有 wrb.fr 框架
  * 
- * Gemini API 返回的是多行嵌套 JSON 数据，每行格式如下:
- * [["wrb.fr", "[[...]]", ...], ...]
+ * 一行 StreamGenerate 数据块可以携带多个框架：最终答案、思考摘要、
+ * 替代草稿、后续建议、图片代理更新等各自是独立的框架。
  * 
- * 解析逻辑:
- * 1. 检查是否有 BardErrorInfo 错误信息
- * 2. 按行分割原始响应文本
- * 3. 跳过不包含 "wrb.fr" 标记的行（非数据行）
- * 4. 跳过长度小于 200 的行（太短，不包含有效数据）
- * 5. 解析每行的 JSON 数据（双层嵌套结构）
- * 6. 从 inner[4] 中提取文本内容
- * 7. 返回最后一个非空文本（通常是最终的完整响应）
+ * @param {string} line - 单行响应文本
+ * @returns {Array} 该行中所有有效框架的内层 payload（inner 数组）
+ */
+function iterFrames(line) {
+  if (line.indexOf('"wrb.fr"') === -1 || line.length < 40) return [];
+  var frames;
+  try {
+    frames = JSON.parse(line);
+  } catch (e) {
+    return [];
+  }
+  if (!Array.isArray(frames)) return [];
+  var out = [];
+  for (var i = 0; i < frames.length; i++) {
+    var frame = frames[i];
+    if (!(Array.isArray(frame) && frame.length > 2 && frame[0] === 'wrb.fr')) continue;
+    var payload = frame[2];
+    if (!(typeof payload === 'string' && payload.length >= 20)) continue;
+    try {
+      var inner = JSON.parse(payload);
+    } catch (e) {
+      continue;
+    }
+    if (Array.isArray(inner) && inner.length > 4 && inner[4]) {
+      out.push(inner);
+    }
+  }
+  return out;
+}
+
+/**
+ * 提取一个框架中所有候选的完整文本
  * 
- * 数据结构说明:
- * 外层 JSON 数组:
- *   [0]: "wrb.fr"（数据标记）
- *   [1]: 预留
- *   [2]: 内层 JSON 字符串
- * 内层 JSON 数组:
- *   [4]: 对话内容数组
- *     [*][0]: 内容类型
- *     [*][1]: 文本数组
+ * 线上格式中每个候选的文本是「多段文字组成的数组」，必须 join 起来才
+ * 是完整答案；把单段当独立答案会只返回片段。
+ * 
+ * @param {Array} inner - 框架的内层 payload
+ * @returns {Array} [{index: 候选索引, text: join 后的完整文本}]
+ */
+function candidateTexts(inner) {
+  var out = [];
+  var parts = inner[4];
+  for (var idx = 0; idx < parts.length; idx++) {
+    var cand = parts[idx];
+    if (Array.isArray(cand) && cand.length > 1 && Array.isArray(cand[1])) {
+      var joined = '';
+      for (var k = 0; k < cand[1].length; k++) {
+        if (typeof cand[1][k] === 'string') joined += cand[1][k];
+      }
+      if (joined) out.push({ index: idx, text: joined });
+    }
+  }
+  return out;
+}
+
+/**
+ * 判断是否为主答案框架
+ * 
+ * 主答案框架在 inner[1] 携带新对话 ID（如 "c_..."）、inner[2] 携带响应
+ * ID（如 "r_..."）。思考摘要、后续建议、搜索与图片代理框架都不带这些
+ * ID——这正是把它们和真正的答案区分开来的依据。
+ * 
+ * @param {Array} inner - 框架的内层 payload
+ * @returns {boolean}
+ */
+function isAnswerFrame(inner) {
+  if (inner.length > 2) {
+    var convId = inner[1];
+    var respId = inner[2];
+    return (typeof convId === 'string' && convId.length > 0 &&
+            typeof respId === 'string' && respId.length > 0);
+  }
+  return false;
+}
+
+/**
+ * 提取一行中最新的主答案文本（用于流式）
+ * 
+ * @param {string} line - 单行响应文本
+ * @returns {string|null} 最新的主候选答案文本，没有则返回 null
+ */
+function bestMainAnswer(line) {
+  var best = '';
+  var frames = iterFrames(line);
+  for (var i = 0; i < frames.length; i++) {
+    var inner = frames[i];
+    if (!isAnswerFrame(inner)) continue;
+    var cands = candidateTexts(inner);
+    for (var j = 0; j < cands.length; j++) {
+      if (cands[j].index === 0 && cands[j].text.length > best.length) {
+        best = cands[j].text;
+      }
+    }
+  }
+  return best || null;
+}
+
+/**
+ * 从 Gemini API 原始响应中提取最终答案文本
+ * 
+ * 选择顺序:
+ *   1. 主答案框架（携带对话/响应 ID 的框架）的第 0 号候选。流式过程中
+ *      该框架会随答案增长被重发，取最长的一次更新。
+ *   2. 任何框架中最长的 join 后候选文本（协议漂移时的兜底）。
+ * 
+ * 绝不采用思考摘要/替代草稿/后续建议框架——旧版「整份响应里最后一段
+ * 非空文字就是答案」的启发式会让这些框架胜出，返回与用户问题完全无关
+ * 的内容。
  * 
  * @param {string} raw - API 原始响应文本
- * @returns {string} 提取并清理后的最终文本
+ * @returns {string} 提取并清理后的最终答案
  * @throws {Error} 如果检测到 BardErrorInfo 错误
  */
 function extractResponseText(raw) {
@@ -1320,70 +1419,30 @@ function extractResponseText(raw) {
     throw new Error('Gemini upstream rejected request: BardErrorInfo [' + bardErr[1] + ']');
   }
 
-  // 第二步：收集所有提取到的文本片段
-  var texts = [];
-
-  // 第三步：按行分割原始响应
+  var mainBest = '';
+  var anyBest = '';
   var lines = raw.split('\n');
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i];
-
-    // 跳过不包含 "wrb.fr" 的行（不是数据行）
-    // 跳过长度小于 200 的行（太短，不包含有效数据）
-    if (line.indexOf('"wrb.fr"') === -1 || line.length < 200) continue;
-
-    try {
-      // 第四步：解析外层 JSON
-      var arr = JSON.parse(line);
-      // 提取内层 JSON 字符串（arr[0][2]）
-      var innerStr = arr[0][2];
-
-      // 跳过空的或太短的内层 JSON
-      if (!innerStr || innerStr.length < 50) continue;
-
-      // 第五步：解析内层 JSON
-      var inner = JSON.parse(innerStr);
-
-      // 第六步：检查 inner[4] 是否存在且包含内容
-      if (Array.isArray(inner) && inner.length > 4 && inner[4]) {
-        var parts = inner[4];
-        // 遍历 inner[4] 的每个部分
-        for (var j = 0; j < parts.length; j++) {
-          var part = parts[j];
-          // part[1] 包含文本数据
-          if (Array.isArray(part) && part.length > 1 && part[1]) {
-            if (Array.isArray(part[1])) {
-              var textItems = part[1];
-              // 遍历文本项
-              for (var k = 0; k < textItems.length; k++) {
-                var t = textItems[k];
-                // 收集非空字符串
-                if (typeof t === 'string' && t.length > 0) {
-                  texts.push(t);
-                }
-              }
-            }
-          }
+    var frames = iterFrames(line);
+    for (var f = 0; f < frames.length; f++) {
+      var inner = frames[f];
+      var cands = candidateTexts(inner);
+      if (cands.length === 0) continue;
+      var isMain = isAnswerFrame(inner);
+      for (var c = 0; c < cands.length; c++) {
+        if (cands[c].text.length > anyBest.length) {
+          anyBest = cands[c].text;
+        }
+        if (isMain && cands[c].index === 0 && cands[c].text.length > mainBest.length) {
+          mainBest = cands[c].text;
         }
       }
-    } catch (e) {
-      // JSON 解析错误，可能是响应不完整
-      // 继续处理下一行，不中断整个解析过程
     }
   }
 
-  // 第七步：获取最后一个非空文本
-  // Gemini 的响应是逐步累积的，最后一个文本通常包含完整内容
-  var text = '';
-  for (var m = texts.length - 1; m >= 0; m--) {
-    if (texts[m].trim()) {
-      text = texts[m];
-      break;
-    }
-  }
-
-  // 第八步：清理代码执行痕迹并返回
-  return cleanGeminiText(text);
+  // 清理代码执行痕迹并返回
+  return cleanGeminiText(mainBest || anyBest);
 }
 
 // ============================================================================
@@ -2137,6 +2196,8 @@ async function handleChatCompletions(request, body, config) {
             var decoder = new TextDecoder();
             var buffer = '';      // 行缓冲区（处理不完整的行）
             var prevText = '';    // 记录之前已发送的完整文本
+            var emittedAny = false;  // 是否已向客户端推送过内容
+            var rawLines = [];       // 已完成的行（流结束时兜底重扫用）
 
             while (true) {
               var readResult = await reader.read();
@@ -2161,58 +2222,74 @@ async function handleChatCompletions(request, body, config) {
               // 遍历每一行完整的数据
               for (var li = 0; li < lines.length; li++) {
                 var line = lines[li];
-                // 跳过不包含数据标记的行或太短的行
-                if (line.indexOf('"wrb.fr"') === -1 || line.length < 200) continue;
+                rawLines.push(line);
 
-                try {
-                  // 解析 Gemini 的嵌套 JSON 响应
-                  var arr = JSON.parse(line);
-                  var innerStr = arr[0][2];
-                  if (!innerStr || innerStr.length < 50) continue;
+                // 只采用主答案框架（携带对话/响应 ID 的框架）的最新文本；
+                // 思考摘要、替代草稿、后续建议等框架一律忽略，从源头杜绝
+                // 把与问题无关的内容拼接进输出
+                var current = bestMainAnswer(line);
+                if (!current) continue;
 
-                  var inner2 = JSON.parse(innerStr);
+                // 重复或较旧的更新（流式过程中同一框架会随答案增长被重发）
+                if (current === prevText || prevText.indexOf(current) === 0) continue;
 
-                  // 提取文本内容
-                  if (Array.isArray(inner2) && inner2.length > 4 && inner2[4]) {
-                    var parts = inner2[4];
-                    for (var pi = 0; pi < parts.length; pi++) {
-                      var part = parts[pi];
-                      if (Array.isArray(part) && part.length > 1 && part[1] && Array.isArray(part[1])) {
-                        var textItems = part[1];
-                        for (var ti = 0; ti < textItems.length; ti++) {
-                          var t = textItems[ti];
-                          // 检查是否有新内容（文本长度增加了）
-                          if (typeof t === 'string' && t.length > prevText.length) {
-                            // 🔑 计算增量文本
-                            // 增量 = 当前完整文本 - 之前已发送的完整文本
-                            var delta = t.slice(prevText.length);
-                            // 清理代码执行痕迹（不 trim，保留空白格式）
-                            var cleaned = cleanGeminiText(delta, false);
-                            if (cleaned) {
-                              // 立即将增量块推送给客户端（打字机效果）
-                              controller.enqueue(streamEncoder.encode('data: ' + JSON.stringify({
-                                id: chatId,
-                                object: 'chat.completion.chunk',
-                                created: timestamp(),
-                                model: modelName,
-                                choices: [{
-                                  index: 0,
-                                  delta: { content: cleaned },
-                                  finish_reason: null
-                                }],
-                              }) + '\n\n'));
-                            }
-                            // 更新已发送的文本记录
-                            prevText = t;
-                          }
-                        }
-                      }
-                    }
+                // 新文本不是已发送内容的延伸（上游中途改写了答案）
+                if (current.indexOf(prevText) !== 0) {
+                  if (emittedAny) {
+                    // 已推送的内容无法收回：冻结在第一版答案上，
+                    // 绝不切片拼接其他框架的文字
+                    log('Stream answer replaced mid-flight; keeping already-emitted text', 'WARN', config);
+                    continue;
                   }
-                } catch (e) {
-                  // JSON 解析错误，继续处理下一行
-                  // Gemini 的响应可能在传输中被截断
+                  // 尚未推送任何内容：丢弃噪音基线，采用真正的答案
+                  prevText = '';
                 }
+
+                // 🔑 计算增量文本（保证是同一答案的延伸，而非无关文本的切片）
+                var delta = current.slice(prevText.length);
+                // 清理代码执行痕迹（不 trim，保留空白格式）
+                var cleaned = cleanGeminiText(delta, false);
+                if (cleaned) {
+                  emittedAny = true;
+                  // 立即将增量块推送给客户端（打字机效果）
+                  controller.enqueue(streamEncoder.encode('data: ' + JSON.stringify({
+                    id: chatId,
+                    object: 'chat.completion.chunk',
+                    created: timestamp(),
+                    model: modelName,
+                    choices: [{
+                      index: 0,
+                      delta: { content: cleaned },
+                      finish_reason: null
+                    }],
+                  }) + '\n\n'));
+                }
+                // 更新已发送的文本记录
+                prevText = current;
+              }
+            }
+
+            // ---- 第四步半：流结束兜底 ----
+            // 严格解析器全程未匹配到主答案框架（协议漂移）时，对缓冲的
+            // 完整响应做降级重扫，避免给客户端返回空流
+            if (!emittedAny && rawLines.length > 0) {
+              try {
+                var fallbackText = extractResponseText(rawLines.join('\n'));
+                if (fallbackText) {
+                  controller.enqueue(streamEncoder.encode('data: ' + JSON.stringify({
+                    id: chatId,
+                    object: 'chat.completion.chunk',
+                    created: timestamp(),
+                    model: modelName,
+                    choices: [{
+                      index: 0,
+                      delta: { content: fallbackText },
+                      finish_reason: null
+                    }],
+                  }) + '\n\n'));
+                }
+              } catch (e) {
+                log('Stream fallback rescan failed: ' + e.message, 'WARN', config);
               }
             }
           } finally {
@@ -2586,7 +2663,7 @@ export default {
       if (path === '/' || path === '/health') {
         return sendJSON({
           status: 'ok',
-          version: '1.5.0-cf-multifingerprint',
+          version: '1.5.1-cf-strict-parsing',
           platform: 'Cloudflare Workers',
           models: Object.keys(MODELS),
           defaultModel: config.defaultModel,

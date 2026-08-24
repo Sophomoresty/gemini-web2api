@@ -29,6 +29,8 @@ import sys
 import uuid
 import re
 import os
+import random
+import threading
 import hashlib
 import argparse
 import base64
@@ -106,6 +108,21 @@ MODELS = {
 }
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
+
+# Browser-like per-session RPC counter. The real Gemini web app sends an
+# ever-increasing _reqid (+100000 per RPC) for every request in a page
+# session. Deriving it from a timestamp made concurrent requests (e.g. a
+# cronjob firing while the user is chatting) send identical ids.
+_REQID_LOCK = threading.Lock()
+_REQID_NEXT = random.randrange(10000, 99999)
+
+
+def _next_reqid() -> int:
+    global _REQID_NEXT
+    with _REQID_LOCK:
+        _REQID_NEXT += 100000
+        return _REQID_NEXT
+
 
 def log(msg: str):
     if CONFIG["log_requests"]:
@@ -250,13 +267,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     if CONFIG.get("xsrf_token"):
         params["at"] = CONFIG["xsrf_token"]
     body = urllib.parse.urlencode(params).encode()
-    reqid = int(time.time()) % 1000000
     prefix = account_prefix()
-    url = (
-        f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
-        "assistant.lamda.BardFrontendService/StreamGenerate"
-        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
-    )
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://gemini.google.com",
@@ -273,10 +284,17 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
 
+    def build_url() -> str:
+        return (
+            f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
+            "assistant.lamda.BardFrontendService/StreamGenerate"
+            f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={_next_reqid()}&rt=c"
+        )
+
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            req = urllib.request.Request(build_url(), data=body, headers=headers, method="POST")
             ctx = ssl.create_default_context()
             proxy = CONFIG.get("proxy")
             if proxy:
@@ -290,12 +308,6 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
             return resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
             if e.code == 405 and update_bl_if_needed():
-                reqid = int(time.time()) % 1000000
-                url = (
-                    f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
-                    "assistant.lamda.BardFrontendService/StreamGenerate"
-                    f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
-                )
                 log("Retrying with updated BL...")
                 last_err = e
                 continue
@@ -341,12 +353,11 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     if CONFIG.get("xsrf_token"):
         params["at"] = CONFIG["xsrf_token"]
     body = urllib.parse.urlencode(params)
-    reqid = int(time.time()) % 1000000
     prefix = account_prefix()
     url = (
         f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
         "assistant.lamda.BardFrontendService/StreamGenerate"
-        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={_next_reqid()}&rt=c"
     )
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -389,26 +400,20 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                             raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{m.group(1)}]")
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
-                        if '"wrb.fr"' not in line or len(line) < 200:
+                        current = best_main_answer(line)
+                        if not current:
                             continue
-                        try:
-                            arr = json.loads(line)
-                            inner_str = arr[0][2]
-                            if not inner_str or len(inner_str) < 50:
+                        if current == prev_text or prev_text.startswith(current):
+                            continue  # duplicate or older update
+                        if not current.startswith(prev_text):
+                            if prev_text:
+                                log("Stream answer replaced mid-flight; keeping already-emitted text")
                                 continue
-                            inner2 = json.loads(inner_str)
-                            if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
-                                for part in inner2[4]:
-                                    if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
-                                        for t in part[1]:
-                                            if isinstance(t, str) and len(t) > len(prev_text):
-                                                delta = t[len(prev_text):]
-                                                delta = clean_gemini_text(delta, strip=False)
-                                                if delta:
-                                                    yield delta
-                                                prev_text = t
-                        except (json.JSONDecodeError, IndexError, TypeError):
-                            pass
+                            prev_text = ""  # first frame was noise; adopt the real answer
+                        delta = clean_gemini_text(current[len(prev_text):], strip=False)
+                        prev_text = current
+                        if delta:
+                            yield delta
         except Exception as e:
             if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 405:
                 if update_bl_if_needed():
@@ -430,37 +435,105 @@ def clean_gemini_text(text: str, strip: bool = True) -> str:
     return text.strip() if strip else text
 
 
+def iter_frames(line: str):
+    """Yield the parsed inner payload of every wrb.fr frame in one response line.
+
+    A single StreamGenerate chunk line can carry several frames; the answer,
+    thought summaries, alternative drafts, follow-up chips and image-agent
+    updates each arrive as separate frames.
+    """
+    if '"wrb.fr"' not in line or len(line) < 40:
+        return
+    try:
+        frames = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(frames, list):
+        return
+    for frame in frames:
+        if not (isinstance(frame, list) and len(frame) > 2 and frame[0] == "wrb.fr"):
+            continue
+        payload = frame[2]
+        if not (isinstance(payload, str) and len(payload) >= 20):
+            continue
+        try:
+            inner = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(inner, list) and len(inner) > 4 and inner[4]:
+            yield inner
+
+
+def candidate_texts(inner: list) -> list:
+    """Return [(candidate_index, joined_text)] for one frame payload.
+
+    Each candidate's text is a *list* of segments in the wire format and must
+    be joined; treating segments as standalone answers returned fragments.
+    """
+    out = []
+    for idx, cand in enumerate(inner[4]):
+        if isinstance(cand, list) and len(cand) > 1 and isinstance(cand[1], list):
+            text = "".join(t for t in cand[1] if isinstance(t, str))
+            if text:
+                out.append((idx, text))
+    return out
+
+
+def is_answer_frame(inner: list) -> bool:
+    """True for the main answer frame, which carries the new conversation id
+    (inner[1], e.g. "c_...") and response id (inner[2], e.g. "r_...").
+
+    Thought summaries, follow-up chips, search and image-agent frames do not
+    carry these ids -- that is what tells them apart from the real answer.
+    """
+    if len(inner) > 2:
+        conv_id, resp_id = inner[1], inner[2]
+        return (isinstance(conv_id, str) and bool(conv_id)
+                and isinstance(resp_id, str) and bool(resp_id))
+    return False
+
+
+def best_main_answer(line: str):
+    """Best primary-candidate answer text found in one line, or None."""
+    best = ""
+    for inner in iter_frames(line):
+        if not is_answer_frame(inner):
+            continue
+        for idx, text in candidate_texts(inner):
+            if idx == 0 and len(text) > len(best):
+                best = text
+    return best or None
+
+
 def extract_response_text(raw: str) -> str:
-    """Parse StreamGenerate response to extract final text."""
+    """Parse StreamGenerate response to extract the final answer text.
+
+    Selection order:
+      1. Primary candidate (index 0) of the main answer frame -- the frame
+         carrying conversation/response ids. Longest update wins (streaming
+         re-sends this frame as the answer grows).
+      2. Longest joined candidate from any frame (protocol drift fallback).
+    Never the thought/draft/chip frames, which previously won the "longest
+    text anywhere" heuristic and produced unrelated answers.
+    """
     import re as _re
     bard_err = _re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
     if bard_err:
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
-    texts = []
+    main_best = ""
+    any_best = ""
     for line in raw.split("\n"):
-        if '"wrb.fr"' not in line or len(line) < 200:
-            continue
-        try:
-            arr = json.loads(line)
-            inner_str = arr[0][2]
-            if not inner_str or len(inner_str) < 50:
+        for inner in iter_frames(line):
+            cands = candidate_texts(inner)
+            if not cands:
                 continue
-            inner = json.loads(inner_str)
-            if isinstance(inner, list) and len(inner) > 4 and inner[4]:
-                for part in inner[4]:
-                    if isinstance(part, list) and len(part) > 1 and part[1]:
-                        if isinstance(part[1], list):
-                            for t in part[1]:
-                                if isinstance(t, str) and len(t) > 0:
-                                    texts.append(t)
-        except (json.JSONDecodeError, IndexError, TypeError):
-            pass
-    text = ""
-    for t in reversed(texts):
-        if t.strip():
-            text = t
-            break
-    return clean_gemini_text(text)
+            is_main = is_answer_frame(inner)
+            for idx, text in cands:
+                if len(text) > len(any_best):
+                    any_best = text
+                if is_main and idx == 0 and len(text) > len(main_best):
+                    main_best = text
+    return clean_gemini_text(main_best or any_best)
 
 
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────

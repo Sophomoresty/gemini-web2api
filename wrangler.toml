@@ -1,0 +1,13 @@
+# Cloudflare Workers 部署設定檔
+#
+# 给「连接 Git 储存库」流程使用：Cloudflare 建置时执行 `npx wrangler deploy`，
+# wrangler 会读取本文件并部署 cloudflare/worker.js。
+#
+# name 可以改成你自己的 Worker 名称（若已在 Dashboard 建立 Worker 并连接
+# Git，请保持与该 Worker 同名，避免部署出第二个 Worker）。
+
+name = "gemini-web2api"
+main = "cloudflare/worker.js"
+compatibility_date = "2025-06-01"
+
+# 免费方案即可运行；此 Worker 为纯 I/O 代理，无 KV / D1 / R2 绑定需求。
