@@ -88,11 +88,13 @@ Supports Google native API endpoints:
 
 | Model | Description | Output |
 |-------|-------------|--------|
-| `gemini-3.6-flash` | All-around model (latest) | ~12k chars |
+| `gemini-3.7-flash` | Latest all-around model | ~12k chars |
+| `gemini-3.6-flash` | All-around model | ~12k chars |
 | `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
 | `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
 | `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
 | `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
+| `gemini-3.1-pro-enhanced` | Pro with enhanced output (experimental) | varies |
 | `gemini-auto` | Auto model selection | varies |
 | `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
 
@@ -130,7 +132,11 @@ Or use the JSON format:
 {"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "sapisid": "your_sapisid_value"}
 ```
 
-**Alternative (browser extension)**: Use any "Export Cookies" extension to export cookies for `gemini.google.com` in Netscape format, then convert to the single-line format above.
+**Alternative (browser extension)**: Use any "Export Cookies" extension to export cookies for `gemini.google.com` in Netscape format (`cookies.txt`). The proxy parses Netscape-format files directly — no conversion needed:
+
+```
+python gemini_web2api.py --cookie-file cookies.txt
+```
 
 ### Authenticated account path and XSRF token
 
@@ -271,7 +277,11 @@ resp = client.chat.completions.create(
 - **Image upload may require cookies**: Multimodal input uses Gemini Web's image upload endpoint. If anonymous upload fails, configure a Gemini cookie.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
-- **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
+- **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked (upstream error `1060` = IP temporarily blocked - use a proxy/different network or wait). To check whether the IP is currently blocked before debugging the proxy itself, run:
+
+```bash
+python probe_upstream.py
+```
 
 ## Requirements
 

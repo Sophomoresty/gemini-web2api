@@ -229,6 +229,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+                # Emit finish chunk so clients don't hang on a dropped stream
+                try:
+                    err_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                                 "model": model_name, "choices": [{"index": 0, "delta": {"content": f"[error] {e}"}, "finish_reason": "stop"}]}
+                    self.wfile.write(f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    pass
             return
 
         try:

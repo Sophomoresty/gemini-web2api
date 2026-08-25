@@ -78,11 +78,13 @@ gemini
 
 | 模型 | 说明 | 输出量 |
 |------|------|--------|
-| `gemini-3.6-flash` | 全能模型 (最新) | ~1.2万字 |
+| `gemini-3.7-flash` | 最新全能模型 | ~1.2万字 |
+| `gemini-3.6-flash` | 全能模型 | ~1.2万字 |
 | `gemini-3.5-flash` | gemini-3.6-flash 别名 | ~1.2万字 |
 | `gemini-3.5-flash-thinking` | 扩展思考, 最长输出 | **~2万字** |
 | `gemini-3.5-flash-thinking-lite` | 自适应思考深度 | ~1.5万字 |
 | `gemini-3.1-pro` | 高级数学与代码 (需 cookie) | ~1.2万字 |
+| `gemini-3.1-pro-enhanced` | Pro 增强输出 (实验性) | 视情况 |
 | `gemini-auto` | 自动选择模型 | 不定 |
 | `gemini-flash-lite` | 最快响应, 轻量 | ~1万字 |
 
@@ -120,7 +122,11 @@ SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值
 {"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "sapisid": "你的SAPISID值"}
 ```
 
-**替代方案 (浏览器扩展)**: 使用任意 "Export Cookies" 扩展导出 `gemini.google.com` 的 cookie, 然后转换为上述单行格式.
+**替代方案 (浏览器扩展)**: 使用任意 "Export Cookies" 扩展导出 `gemini.google.com` 的 cookie (Netscape 格式, `cookies.txt`). 代理可直接解析 Netscape 格式文件, 无需转换:
+
+```
+python gemini_web2api.py --cookie-file cookies.txt
+```
 
 ### 登录账号路径与 XSRF Token
 
@@ -244,7 +250,11 @@ resp = client.chat.completions.create(
 - **图片上传可能需要 Cookie**: 多模态输入使用 Gemini 网页端图片上传接口。匿名上传失败时, 请配置 Gemini cookie。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
-- **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.
+- **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封 (upstream 错误 `1060` = IP 被临时封禁 - 使用代理/更换网络或等待). 排查代理前可先确认 IP 是否被封:
+
+```bash
+python probe_upstream.py
+```
 
 ## 系统要求
 

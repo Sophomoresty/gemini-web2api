@@ -4,7 +4,7 @@ import os
 
 from .config import CONFIG, load_config, find_config
 from .models import MODELS
-from .gemini import HAS_HTTPX
+from .gemini import HAS_HTTPX, refresh_bl_and_xsrf
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
 
@@ -28,6 +28,8 @@ def main():
         CONFIG["cookie_file"] = args.cookie_file
     if args.proxy:
         CONFIG["proxy"] = args.proxy
+
+    refresh_bl_and_xsrf()
 
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)

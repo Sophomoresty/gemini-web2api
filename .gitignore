@@ -7,3 +7,6 @@ cookie.json
 .idea
 .DS_Store
 gemini-auth.json
+
+cookies.txt
+config_backup.json
