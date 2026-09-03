@@ -78,7 +78,9 @@ gemini
 
 | 模型 | 说明 | 输出量 |
 |------|------|--------|
-| `gemini-3.6-flash` | 全能模型 (最新) | ~1.2万字 |
+| `gemini-3.8-flash` | 全能模型 (最新) | ~1.2万字 |
+| `gemini-3.7-flash` | 全能模型 | ~1.2万字 |
+| `gemini-3.6-flash` | 全能模型 | ~1.2万字 |
 | `gemini-3.5-flash` | gemini-3.6-flash 别名 | ~1.2万字 |
 | `gemini-3.5-flash-thinking` | 扩展思考, 最长输出 | **~2万字** |
 | `gemini-3.5-flash-thinking-lite` | 自适应思考深度 | ~1.5万字 |
