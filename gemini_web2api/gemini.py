@@ -41,7 +41,11 @@ def _get_httpx_client():
     if _httpx_client is None and HAS_HTTPX:
         proxy = CONFIG.get("proxy")
         transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        # Connection: close disables keep-alive reuse — the proxy/upstream kills
+        # idle connections, and reusing a dead one fails mid-stream with
+        # "[SSL] record layer failure", which corrupts streaming responses.
+        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True,
+                                     headers={"Connection": "close"})
     return _httpx_client
 
 
@@ -273,6 +277,12 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 yield delta
             return
         except Exception as e:
+            if emitted_raw_text:
+                # Partial content already streamed: a retry would either fail the
+                # prefix check or splice two different generations together, so end
+                # the stream cleanly and let the client ask to continue.
+                log(f"Stream interrupted after partial output ({len(emitted_raw_text)} chars), ending cleanly: {e}")
+                return
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
