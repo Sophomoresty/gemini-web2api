@@ -13,6 +13,9 @@ from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prom
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
+# Fence marker the model is instructed to wrap tool calls in (see tools.py).
+TOOL_CALL_MARKER = "```tool_call"
+
 
 def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
@@ -192,6 +195,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         stream = req.get("stream", False)
+        log(f"Chat completions: stream={stream}, tools={len(tools) if tools else 0}, model={model_name}")
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         try:
             file_refs = _upload_images(images)
@@ -223,6 +227,80 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                        "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                 self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Stream error: {e}")
+            return
+
+        if stream:
+            # Tools present + streaming: forward prose deltas in real time,
+            # but hold back ```tool_call fenced blocks (including a fence start
+            # straddling delta boundaries) so they can be parsed into OpenAI
+            # tool_calls at end of stream instead of leaking into chat text.
+            self._start_sse()
+            first_chunk = {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": None,
+                }],
+            }
+            self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
+            self.wfile.flush()
+
+            def send_delta(content=None, tool_calls=None, finish=None):
+                delta = {}
+                if content is not None:
+                    delta["content"] = content
+                if tool_calls:
+                    delta["tool_calls"] = tool_calls
+                chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                         "model": model_name, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+
+            full_text = ""
+            emitted = 0
+            finish = "stop"
+            try:
+                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                    full_text += delta
+                    marker_pos = full_text.find(TOOL_CALL_MARKER)
+                    # Without a marker, hold back the last len(marker)-1 chars so a
+                    # fence start split across deltas is not forwarded prematurely.
+                    limit = marker_pos if marker_pos != -1 else len(full_text) - len(TOOL_CALL_MARKER) + 1
+                    if limit > emitted:
+                        send_delta(content=full_text[emitted:limit])
+                        emitted = limit
+                clean, tool_calls = parse_tool_calls(full_text)
+                if tool_calls:
+                    log(f"Chat tool-fenced streaming: parsed {len(tool_calls)} tool call(s)")
+                    if len(clean) > emitted:
+                        send_delta(content=clean[emitted:])
+                    for i, tc in enumerate(tool_calls):
+                        send_delta(tool_calls=[{
+                            "index": i,
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["function"]["name"],
+                                "arguments": tc["function"]["arguments"],
+                            },
+                        }])
+                    finish = "tool_calls"
+                else:
+                    # No (or malformed) tool call: forward whatever is still
+                    # buffered, raw, so nothing disappears silently.
+                    if len(full_text) > emitted:
+                        send_delta(content=full_text[emitted:])
+                send_delta(finish=finish)
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):

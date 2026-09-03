@@ -440,6 +440,98 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[4][1]["arguments"], '{"city":"Shanghai"}')
         self.assertEqual(events[-1][1]["response"]["output"][0]["name"], "get_weather")
 
+    def _stream_chunks(self, body):
+        return [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+
+    @staticmethod
+    def _tools_payload():
+        return [{
+            "type": "function",
+            "function": {"name": "write_file", "description": "write a file", "parameters": {}},
+        }]
+
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_chat_stream_with_tools_parses_tool_call_deltas(self, generate_stream):
+        generate_stream.return_value = iter([
+            "Creating the file.\n",
+            "```tool_call\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\"}}\n```",
+        ])
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "go"}],
+                "stream": True,
+                "tools": self._tools_payload(),
+            },
+        )
+
+        self.assertEqual(status, 200)
+        chunks = self._stream_chunks(body)
+        contents = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+        self.assertEqual(contents, "Creating the file.\n")
+        self.assertNotIn("tool_call", contents)
+        tc_deltas = [c for c in chunks if c["choices"][0]["delta"].get("tool_calls")]
+        self.assertEqual(len(tc_deltas), 1)
+        call = tc_deltas[0]["choices"][0]["delta"]["tool_calls"][0]
+        self.assertTrue(call["id"].startswith("call_"))
+        self.assertEqual(call["type"], "function")
+        self.assertEqual(call["function"]["name"], "write_file")
+        self.assertEqual(json.loads(call["function"]["arguments"]), {"path": "a.txt"})
+        finishes = [c["choices"][0]["finish_reason"] for c in chunks if c["choices"][0]["finish_reason"]]
+        self.assertEqual(finishes, ["tool_calls"])
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_chat_stream_malformed_tool_call_falls_back_to_text(self, generate_stream):
+        raw = '```tool_call\n{"name": "write_file", "arguments": {"path":'
+        generate_stream.return_value = iter([raw])
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "go"}],
+                "stream": True,
+                "tools": self._tools_payload(),
+            },
+        )
+
+        self.assertEqual(status, 200)
+        chunks = self._stream_chunks(body)
+        contents = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+        self.assertEqual(contents, raw)
+        finishes = [c["choices"][0]["finish_reason"] for c in chunks if c["choices"][0]["finish_reason"]]
+        self.assertEqual(finishes, ["stop"])
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_chat_stream_with_tools_plain_text_fully_streamed(self, generate_stream):
+        generate_stream.return_value = iter(["Hello", " there friend"])
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "go"}],
+                "stream": True,
+                "tools": self._tools_payload(),
+            },
+        )
+
+        self.assertEqual(status, 200)
+        chunks = self._stream_chunks(body)
+        contents = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+        self.assertEqual(contents, "Hello there friend")
+        finishes = [c["choices"][0]["finish_reason"] for c in chunks if c["choices"][0]["finish_reason"]]
+        self.assertEqual(finishes, ["stop"])
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
 
 if __name__ == "__main__":
     unittest.main()
