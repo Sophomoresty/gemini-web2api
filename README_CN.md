@@ -78,9 +78,30 @@ gemini
 
 | 模型 | 说明 | 输出量 |
 |------|------|--------|
-| `gemini-3.6-flash` | 全能模型 (最新) | ~1.2万字 |
+| `gemini-3.8-flash` | 全能模型 (最新) | ~1.2万字 |
+| `gemini-3.8-flash-high` | 深度思考模式 (High 思考深度，最新) | **~2万字** |
+| `gemini-3.8-flash-thinking` | 深度思考模式 (Gemini 3.8 Flash) | **~2万字** |
+| `gemini-3.8-flash-thinking@think=0` | Gemini 3.8 Flash 深度思考 (最深思考, think=0) | **~2万字** |
+| `gemini-3.8-flash-thinking@think=2` | Gemini 3.8 Flash 深度思考 (中等思考, think=2) | ~1.5万字 |
+| `gemini-3.8-flash-thinking@think=4` | Gemini 3.8 Flash 深度思考 (最浅思考, think=4) | ~1.2万字 |
+| `gemini-3.7-flash` | 全能模型 | ~1.2万字 |
+| `gemini-3.7-flash-high` | 深度思考模式 (High 思考深度) | **~2万字** |
+| `gemini-3.7-flash-thinking` | 深度思考模式 (Gemini 3.7 Flash) | **~2万字** |
+| `gemini-3.7-flash-thinking@think=0` | Gemini 3.7 Flash 深度思考 (最深思考, think=0) | **~2万字** |
+| `gemini-3.7-flash-thinking@think=2` | Gemini 3.7 Flash 深度思考 (中等思考, think=2) | ~1.5万字 |
+| `gemini-3.7-flash-thinking@think=4` | Gemini 3.7 Flash 深度思考 (最浅思考, think=4) | ~1.2万字 |
+| `gemini-3.6-flash` | 全能模型 | ~1.2万字 |
+| `gemini-3.6-flash-high` | 深度思考模式 (High 思考深度) | **~2万字** |
+| `gemini-3.6-flash-thinking` | 深度思考模式 (Gemini 3.6 Flash) | **~2万字** |
+| `gemini-3.6-flash-thinking@think=0` | Gemini 3.6 Flash 深度思考 (最深思考, think=0) | **~2万字** |
+| `gemini-3.6-flash-thinking@think=2` | Gemini 3.6 Flash 深度思考 (中等思考, think=2) | ~1.5万字 |
+| `gemini-3.6-flash-thinking@think=4` | Gemini 3.6 Flash 深度思考 (最浅思考, think=4) | ~1.2万字 |
 | `gemini-3.5-flash` | gemini-3.6-flash 别名 | ~1.2万字 |
+| `gemini-3.5-flash-high` | 深度思考模式 (High 思考深度) | **~2万字** |
 | `gemini-3.5-flash-thinking` | 扩展思考, 最长输出 | **~2万字** |
+| `gemini-3.5-flash-thinking@think=0` | Gemini 3.5 Flash 深度思考 (最深思考, think=0) | **~2万字** |
+| `gemini-3.5-flash-thinking@think=2` | Gemini 3.5 Flash 深度思考 (中等思考, think=2) | ~1.5万字 |
+| `gemini-3.5-flash-thinking@think=4` | Gemini 3.5 Flash 深度思考 (最浅思考, think=4) | ~1.2万字 |
 | `gemini-3.5-flash-thinking-lite` | 自适应思考深度 | ~1.5万字 |
 | `gemini-3.1-pro` | 高级数学与代码 (需 cookie) | ~1.2万字 |
 | `gemini-auto` | 自动选择模型 | 不定 |

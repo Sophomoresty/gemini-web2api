@@ -8,8 +8,11 @@ from urllib.parse import parse_qs
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.gemini import _build_payload
+from gemini_web2api.models import MODELS, resolve_model
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
+import importlib.util
+import os
 
 
 def _decode_payload(payload):
@@ -184,6 +187,15 @@ class StreamingEndpointTests(unittest.TestCase):
             headers={"Content-Type": "application/json"},
             encode_chunked=True,
         )
+        response = connection.getresponse()
+        body = response.read().decode()
+        headers = dict(response.getheaders())
+        connection.close()
+        return response.status, headers, body
+
+    def get_json(self, path):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("GET", path)
         response = connection.getresponse()
         body = response.read().decode()
         headers = dict(response.getheaders())
@@ -439,6 +451,132 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[3][1]["delta"], '{"city":"Shanghai"}')
         self.assertEqual(events[4][1]["arguments"], '{"city":"Shanghai"}')
         self.assertEqual(events[-1][1]["response"]["output"][0]["name"], "get_weather")
+
+    def test_v1_models_contains_38_flash_high(self):
+        status, _, body = self.get_json("/v1/models")
+        self.assertEqual(status, 200)
+        data = json.loads(body)["data"]
+        model_ids = [m["id"] for m in data]
+        self.assertIn("gemini-3.8-flash-high", model_ids)
+        self.assertIn("gemini-3.8-flash-thinking", model_ids)
+
+    @mock.patch("gemini_web2api.server.generate", return_value="high ok")
+    def test_chat_with_38_flash_high_routes_correctly(self, generate):
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.8-flash-high",
+                "messages": [{"role": "user", "content": "solve this"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "high ok")
+        self.assertEqual(generate.call_args.args[1], 2)  # model_id == 2 (THINKING)
+        self.assertEqual(generate.call_args.args[2], 0)  # think_mode == 0 (High)
+
+
+class ModelResolutionTests(unittest.TestCase):
+    def test_gemini_38_flash_high_in_models(self):
+        self.assertIn("gemini-3.8-flash-high", MODELS)
+        self.assertEqual(MODELS["gemini-3.8-flash-high"]["mode"], 2)
+        self.assertEqual(MODELS["gemini-3.8-flash-high"]["think"], 0)
+
+    def test_gemini_38_flash_thinking_in_models(self):
+        self.assertIn("gemini-3.8-flash-thinking", MODELS)
+        self.assertEqual(MODELS["gemini-3.8-flash-thinking"]["mode"], 2)
+        self.assertEqual(MODELS["gemini-3.8-flash-thinking"]["think"], 0)
+
+    def test_resolve_model_38_flash_high(self):
+        name, mode, think, err, extra = resolve_model("gemini-3.8-flash-high")
+        self.assertEqual(name, "gemini-3.8-flash-high")
+        self.assertEqual(mode, 2)
+        self.assertEqual(think, 0)
+        self.assertIsNone(err)
+
+    def test_resolve_model_38_flash_thinking(self):
+        name, mode, think, err, extra = resolve_model("gemini-3.8-flash-thinking")
+        self.assertEqual(name, "gemini-3.8-flash-thinking")
+        self.assertEqual(mode, 2)
+        self.assertEqual(think, 0)
+        self.assertIsNone(err)
+
+    def test_resolve_model_38_flash_high_aliases(self):
+        for alias in ["gemini-3.8-flash:high", "gemini-3.8-flash (high)", "3.8-flash-high", "3.8 flash high"]:
+            name, mode, think, err, extra = resolve_model(alias)
+            self.assertEqual(name, "gemini-3.8-flash-high")
+            self.assertEqual(mode, 2)
+            self.assertEqual(think, 0)
+            self.assertIsNone(err)
+
+    def test_single_file_script_resolves_38_flash_high(self):
+        script_path = os.path.join(os.path.dirname(__file__), "..", "gemini_web2api.py")
+        spec = importlib.util.spec_from_file_location("gemini_web2api_standalone", script_path)
+        standalone = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(standalone)
+        handler = standalone.GeminiHandler
+        name, mode, think, err = handler._resolve_model(None, "gemini-3.8-flash-high")
+        self.assertEqual(name, "gemini-3.8-flash-high")
+        self.assertEqual(mode, 2)
+        self.assertEqual(think, 0)
+        self.assertIsNone(err)
+
+        for alias in ["gemini-3.8-flash:high", "gemini-3.8-flash (high)", "3.8-flash-high", "3.8 flash high"]:
+            name, mode, think, err = handler._resolve_model(None, alias)
+            self.assertEqual(name, "gemini-3.8-flash-high")
+            self.assertEqual(mode, 2)
+            self.assertEqual(think, 0)
+            self.assertIsNone(err)
+
+    def test_all_flash_thinking_and_think_params_in_models(self):
+        for version in ["3.8", "3.7", "3.6", "3.5"]:
+            base = f"gemini-{version}-flash"
+            self.assertIn(f"{base}-thinking", MODELS)
+            self.assertIn(f"{base}-thinking@think=0", MODELS)
+            self.assertIn(f"{base}-thinking@think=2", MODELS)
+            self.assertIn(f"{base}-thinking@think=4", MODELS)
+            self.assertIn(f"{base}-high", MODELS)
+
+            # Check deepest
+            name, mode, think, err, _ = resolve_model(f"{base}-thinking@think=0")
+            self.assertEqual(name, f"{base}-thinking@think=0")
+            self.assertEqual(mode, 2)
+            self.assertEqual(think, 0)
+            self.assertIsNone(err)
+
+            # Check medium
+            name, mode, think, err, _ = resolve_model(f"{base}-thinking@think=2")
+            self.assertEqual(name, f"{base}-thinking@think=2")
+            self.assertEqual(mode, 2)
+            self.assertEqual(think, 2)
+            self.assertIsNone(err)
+
+            # Check shallowest
+            name, mode, think, err, _ = resolve_model(f"{base}-thinking@think=4")
+            self.assertEqual(name, f"{base}-thinking@think=4")
+            self.assertEqual(mode, 2)
+            self.assertEqual(think, 4)
+            self.assertIsNone(err)
+
+    def test_standalone_resolves_all_flash_thinking_options(self):
+        script_path = os.path.join(os.path.dirname(__file__), "..", "gemini_web2api.py")
+        spec = importlib.util.spec_from_file_location("gemini_web2api_standalone", script_path)
+        standalone = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(standalone)
+        handler = standalone.GeminiHandler
+
+        for version in ["3.8", "3.7", "3.6", "3.5"]:
+            base = f"gemini-{version}-flash"
+            name, mode, think, err = handler._resolve_model(None, f"{base}-thinking@think=0")
+            self.assertEqual(name, f"{base}-thinking@think=0")
+            self.assertEqual(mode, 2)
+            self.assertEqual(think, 0)
+            self.assertIsNone(err)
+
+            name, mode, think, err = handler._resolve_model(None, f"{base}-thinking@think=2")
+            self.assertEqual(name, f"{base}-thinking@think=2")
+            self.assertEqual(mode, 2)
+            self.assertEqual(think, 2)
+            self.assertIsNone(err)
 
 
 if __name__ == "__main__":

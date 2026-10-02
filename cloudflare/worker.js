@@ -440,20 +440,152 @@ function getRandomSecChUaPlatform() {
 //   4 = AUTO（自动选择思考深度，由 Gemini 决定）
 
 var MODELS = {
+  // Gemini 3.8
+  'gemini-3.8-flash': {
+    mode: 1,        // FAST - 快速模式
+    think: 4,       // AUTO - 自动选择思考深度
+    desc: 'Latest all-around model (Gemini 3.8 Flash)',
+  },
+  'gemini-3.8-flash-high': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考 (High 思考深度)
+    desc: 'Latest all-around model with high thinking depth (Gemini 3.8 Flash High, ~20k chars)',
+  },
+  'gemini-3.8-flash-thinking': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Deep thinking mode (Gemini 3.8 Flash), longest output (~20k chars)',
+  },
+  'gemini-3.8-flash-thinking@think=0': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Gemini 3.8 Flash thinking mode - deepest reasoning (~20k chars)',
+  },
+  'gemini-3.8-flash-thinking@think=2': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 2,       // 中等思考深度
+    desc: 'Gemini 3.8 Flash thinking mode - medium reasoning (~15k chars)',
+  },
+  'gemini-3.8-flash-thinking@think=4': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 4,       // 最浅思考深度
+    desc: 'Gemini 3.8 Flash thinking mode - shallowest reasoning (~12k chars)',
+  },
+  'gemini-3.8-flash@think=0': {
+    mode: 1,        // FAST
+    think: 0,       // 深度思考
+    desc: 'Gemini 3.8 Flash with deep thinking (think=0)',
+  },
+
+  // Gemini 3.7
+  'gemini-3.7-flash': {
+    mode: 1,        // FAST - 快速模式
+    think: 4,       // AUTO - 自动选择思考深度
+    desc: 'All-around model (Gemini 3.7 Flash)',
+  },
+  'gemini-3.7-flash-high': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Gemini 3.7 Flash with high thinking depth (~20k chars)',
+  },
+  'gemini-3.7-flash-thinking': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Deep thinking mode (Gemini 3.7 Flash), longest output (~20k chars)',
+  },
+  'gemini-3.7-flash-thinking@think=0': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Gemini 3.7 Flash thinking mode - deepest reasoning (~20k chars)',
+  },
+  'gemini-3.7-flash-thinking@think=2': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 2,       // 中等思考深度
+    desc: 'Gemini 3.7 Flash thinking mode - medium reasoning (~15k chars)',
+  },
+  'gemini-3.7-flash-thinking@think=4': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 4,       // 最浅思考深度
+    desc: 'Gemini 3.7 Flash thinking mode - shallowest reasoning (~12k chars)',
+  },
+  'gemini-3.7-flash@think=0': {
+    mode: 1,        // FAST
+    think: 0,       // 深度思考
+    desc: 'Gemini 3.7 Flash with deep thinking (think=0)',
+  },
+
+  // Gemini 3.6
   'gemini-3.6-flash': {
     mode: 1,        // FAST - 快速模式
     think: 4,       // AUTO - 自动选择思考深度
-    desc: 'Latest all-around model (Gemini 3.6 Flash)',
+    desc: 'All-around model (Gemini 3.6 Flash)',
   },
+  'gemini-3.6-flash-high': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Gemini 3.6 Flash with high thinking depth (~20k chars)',
+  },
+  'gemini-3.6-flash-thinking': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Deep thinking mode (Gemini 3.6 Flash), longest output (~20k chars)',
+  },
+  'gemini-3.6-flash-thinking@think=0': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Gemini 3.6 Flash thinking mode - deepest reasoning (~20k chars)',
+  },
+  'gemini-3.6-flash-thinking@think=2': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 2,       // 中等思考深度
+    desc: 'Gemini 3.6 Flash thinking mode - medium reasoning (~15k chars)',
+  },
+  'gemini-3.6-flash-thinking@think=4': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 4,       // 最浅思考深度
+    desc: 'Gemini 3.6 Flash thinking mode - shallowest reasoning (~12k chars)',
+  },
+  'gemini-3.6-flash@think=0': {
+    mode: 1,        // FAST
+    think: 0,       // 深度思考
+    desc: 'Gemini 3.6 Flash with deep thinking (think=0)',
+  },
+
+  // Gemini 3.5
   'gemini-3.5-flash': {
     mode: 1,        // FAST
     think: 4,       // AUTO
     desc: 'Alias for gemini-3.6-flash (backend upgraded)',
   },
+  'gemini-3.5-flash-high': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Gemini 3.5 Flash with high thinking depth (~20k chars)',
+  },
   'gemini-3.5-flash-thinking': {
     mode: 2,        // THINKING - 深度思考模式
     think: 0,       // 启用深度思考
     desc: 'Deep thinking mode, longest output (~20k chars)',
+  },
+  'gemini-3.5-flash-thinking@think=0': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Gemini 3.5 Flash thinking mode - deepest reasoning (~20k chars)',
+  },
+  'gemini-3.5-flash-thinking@think=2': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 2,       // 中等思考深度
+    desc: 'Gemini 3.5 Flash thinking mode - medium reasoning (~15k chars)',
+  },
+  'gemini-3.5-flash-thinking@think=4': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 4,       // 最浅思考深度
+    desc: 'Gemini 3.5 Flash thinking mode - shallowest reasoning (~12k chars)',
+  },
+  'gemini-3.5-flash@think=0': {
+    mode: 1,        // FAST
+    think: 0,       // 深度思考
+    desc: 'Gemini 3.5 Flash with deep thinking (think=0)',
   },
   'gemini-3.1-pro': {
     mode: 3,        // PRO - 专业版
@@ -1854,7 +1986,53 @@ function sendSSE(stream) {
  *   - thinkMode: 思考模式（0=深度思考, 4=自动）
  *   - error: 错误信息，null 表示正常
  */
+var MODEL_ALIASES = {
+  // 3.8 aliases
+  'gemini-3.8-flash:high': 'gemini-3.8-flash-high',
+  'gemini-3.8-flash (high)': 'gemini-3.8-flash-high',
+  'gemini-3.8-flash-thinking-high': 'gemini-3.8-flash-high',
+  'gemini-3.8-flash-thinking-medium': 'gemini-3.8-flash-thinking@think=2',
+  'gemini-3.8-flash-thinking-low': 'gemini-3.8-flash-thinking@think=4',
+  '3.8-flash-high': 'gemini-3.8-flash-high',
+  '3.8 flash high': 'gemini-3.8-flash-high',
+  '3.8-flash': 'gemini-3.8-flash',
+  '3.8-flash-thinking': 'gemini-3.8-flash-thinking',
+
+  // 3.7 aliases
+  'gemini-3.7-flash:high': 'gemini-3.7-flash-high',
+  'gemini-3.7-flash (high)': 'gemini-3.7-flash-high',
+  'gemini-3.7-flash-thinking-high': 'gemini-3.7-flash-high',
+  'gemini-3.7-flash-thinking-medium': 'gemini-3.7-flash-thinking@think=2',
+  'gemini-3.7-flash-thinking-low': 'gemini-3.7-flash-thinking@think=4',
+  '3.7-flash-high': 'gemini-3.7-flash-high',
+  '3.7 flash high': 'gemini-3.7-flash-high',
+  '3.7-flash': 'gemini-3.7-flash',
+  '3.7-flash-thinking': 'gemini-3.7-flash-thinking',
+
+  // 3.6 aliases
+  'gemini-3.6-flash:high': 'gemini-3.6-flash-high',
+  'gemini-3.6-flash (high)': 'gemini-3.6-flash-high',
+  'gemini-3.6-flash-thinking-high': 'gemini-3.6-flash-high',
+  'gemini-3.6-flash-thinking-medium': 'gemini-3.6-flash-thinking@think=2',
+  'gemini-3.6-flash-thinking-low': 'gemini-3.6-flash-thinking@think=4',
+  '3.6-flash-high': 'gemini-3.6-flash-high',
+  '3.6 flash high': 'gemini-3.6-flash-high',
+  '3.6-flash': 'gemini-3.6-flash',
+  '3.6-flash-thinking': 'gemini-3.6-flash-thinking',
+
+  // 3.5 aliases
+  'gemini-3.5-flash:high': 'gemini-3.5-flash-high',
+  'gemini-3.5-flash (high)': 'gemini-3.5-flash-high',
+  'gemini-3.5-flash-thinking-high': 'gemini-3.5-flash-high',
+  'gemini-3.5-flash-thinking-medium': 'gemini-3.5-flash-thinking@think=2',
+  'gemini-3.5-flash-thinking-low': 'gemini-3.5-flash-thinking@think=4',
+  '3.5-flash-high': 'gemini-3.5-flash-high',
+  '3.5 flash high': 'gemini-3.5-flash-high',
+  '3.5-flash': 'gemini-3.5-flash',
+};
+
 function resolveModel(modelName) {
+  var originalName = modelName;
   var thinkOverride = null;
   var actualModelName = modelName;
 
@@ -1868,15 +2046,24 @@ function resolveModel(modelName) {
     }
   }
 
-  // 查找模型配置
-  var cfg = MODELS[actualModelName];
-  if (!cfg) {
-    return { error: '未知模型: ' + actualModelName };
+  if (!MODELS[actualModelName]) {
+    var key = actualModelName.toLowerCase().trim();
+    if (MODEL_ALIASES[key]) {
+      actualModelName = MODEL_ALIASES[key];
+    }
   }
+
+  // 查找模型配置
+  var cfg = MODELS[originalName] || MODELS[actualModelName];
+  if (!cfg) {
+    return { error: '未知模型: ' + originalName };
+  }
+
+  var retName = (MODELS[originalName] || originalName.indexOf('@think=') !== -1) ? originalName : actualModelName;
 
   // 返回解析结果
   return {
-    modelName: actualModelName,
+    modelName: retName,
     modelId: cfg.mode,                                            // 模型类别 ID
     thinkMode: thinkOverride !== null ? thinkOverride : cfg.think,  // 使用覆盖值或默认值
     error: null,
