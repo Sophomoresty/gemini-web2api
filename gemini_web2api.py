@@ -61,8 +61,94 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
-    "temporary_chats": False,
+    "temporary_chats": True,
+    "persistent_chat": False,
 }
+
+# ─── Persistent chat window (for cache reuse) ────────────────────────────────
+# When persistent_chat is enabled, the proxy reuses the SAME Gemini Web chat
+# across requests within a DSH session window, so Google can serve a prefix KV
+# cache (faster, less quota). The window is detected heuristically from the
+# OpenAI messages array: an increasing message count = same chat continuing;
+# a shrink (new DSH window / history reset) = start a fresh chat.
+class ChatWindow:
+    """Tracks the active Gemini Web conversation so persistent_chat can reuse
+    it across requests (prefix KV cache reuse). Conversation continuation on
+    the web protocol works via inner[2] = [conv_id, resp_id, ...]:
+      - conv_id (c_xxx) identifies the conversation; stays stable.
+      - resp_id (r_xxx) is the last response id; must be updated each turn.
+    New window is detected heuristically: no history, message count shrink
+    (new DSH window / history reset), or idle timeout."""
+
+    def __init__(self):
+        self.conv_id = None          # c_xxx (stable)
+        self.resp_id = None          # r_xxx (updates every turn)
+        self.sent_msg_count = 0      # msgs already sent to Google in this window
+        self.last_msg_count = None
+        self.last_ts = None
+        self.is_new_window = False   # set by resolve() for the current request
+        self._pending_send_count = 0  # msg count to advance on successful response
+
+    def resolve(self, msg_count: int, idle_timeout_s: int = 1800) -> None:
+        """Decide whether this request continues the current chat. If it is a
+        new window, reset conv/resp ids so the next request starts fresh."""
+        import time as _t
+        now = _t.time()
+        is_new = (
+            self.conv_id is None
+            or self.last_msg_count is None
+            or msg_count < self.last_msg_count
+            or (self.last_ts is not None and now - self.last_ts > idle_timeout_s)
+        )
+        self.is_new_window = is_new
+        if is_new:
+            self.conv_id = None
+            self.resp_id = None
+            self.sent_msg_count = 0
+            log(f"ChatWindow: new window (msgs={msg_count})")
+        else:
+            log(f"ChatWindow: continue window (msgs={msg_count} conv={self.conv_id[:8] if self.conv_id else None})")
+        self.last_msg_count = msg_count
+        self.last_ts = now
+
+    def update_from_response(self, conv_id, resp_id) -> None:
+        """Store conversation ids observed in a response (called after a turn)."""
+        if conv_id:
+            self.conv_id = conv_id
+        if resp_id:
+            self.resp_id = resp_id
+        # A real c_ id confirms this request succeeded upstream, so the sent
+        # counter can advance (next request sends only the delta).
+        if conv_id and self._pending_send_count:
+            self.advance_sent(self._pending_send_count)
+            self._pending_send_count = 0
+
+    def advance_sent(self, msg_count: int) -> None:
+        """Mark msg_count messages as successfully sent to the current chat.
+        Called only after a successful upstream response, so a failed turn that
+        DSH retries re-sends the same tail instead of computing an empty delta."""
+        if msg_count > self.sent_msg_count:
+            self.sent_msg_count = msg_count
+
+    def mark_request_sent(self, msg_count: int) -> None:
+        """Record the current request's total msg count as 'to be advanced'
+        once the upstream responds successfully. Falls back safely if the
+        window is not active."""
+        self._pending_send_count = msg_count if self.active else 0
+
+    def confirm_sent(self) -> None:
+        """Called after a successful upstream response: advance the sent
+        counter so the next request only sends the delta."""
+        if getattr(self, "_pending_send_count", 0):
+            self.advance_sent(self._pending_send_count)
+            self._pending_send_count = 0
+
+    @property
+    def active(self) -> bool:
+        return self.conv_id is not None
+
+
+CHAT_WINDOW = ChatWindow()
 
 CONFIG = dict(DEFAULT_CONFIG)
 
@@ -71,9 +157,13 @@ CONFIG = dict(DEFAULT_CONFIG)
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+    "gemini-3.8-flash": {
+        "mode": 1, "think": 0,
+        "desc": "Latest all-around model (Gemini 3.8 Flash)",
+    },
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
-        "desc": "Latest all-around model (Gemini 3.7 Flash)",
+        "desc": "All-around model (Gemini 3.7 Flash)",
     },
     "gemini-3.6-flash": {
         "mode": 1, "think": 4,
@@ -105,16 +195,72 @@ MODELS = {
     },
 }
 
+# ─── Model selection header (x-goog-ext-525001261-jspb) ─────────────────────
+# Verified internal model IDs (from browser captures, Issue #82).
+# When this header is absent, upstream ignores slot79 and serves the account
+# default model, so model selection silently no-ops. See:
+#   https://github.com/Sophomoresty/gemini-web2api/issues/82
+MODEL_IDS = {
+    "gemini-3.8-flash": "56fdd199312815e2",   # not yet verified separately; 3.7 ID is stable
+    "gemini-3.7-flash": "56fdd199312815e2",   # cat 1 (verified)
+    "gemini-3.6-flash": "56fdd199312815e2",   # alias to 3.7 id for now
+    "gemini-3.5-flash": "56fdd199312815e2",
+    "gemini-3.1-pro": "e6fa609c3fa255c0",     # cat 3 (verified)
+    "gemini-flash-lite": "8c46e95b1a07cecc",  # cat 6 (verified)
+    "gemini-3.5-flash-thinking": "56fdd199312815e2",
+    "gemini-3.5-flash-thinking-lite": "56fdd199312815e2",
+    "gemini-auto": None,                      # no header = account default
+}
+
+def build_model_header(model_name: str, model_id: int) -> Optional[str]:
+    """Build the x-goog-ext-525001261-jspb model-selection header.
+
+    Contract (Issue #82): [1,null,null,null,"<model_id>",null,null,0,
+    [4,5,6,8,4,5,6,8],null,null,2,null,null,<category>,<extended>,"<uuid>"]
+    idx4 = model selector; idx14 must equal payload slot79; idx15 = slot80.
+    Returns None for models without a known internal ID (-> account default).
+    """
+    mid = MODEL_IDS.get(model_name)
+    if not mid:
+        return None
+    try:
+        return json.dumps(
+            [1, None, None, None, mid, None, None, 0,
+             [4, 5, 6, 8, 4, 5, 6, 8], None, None, 2,
+             None, None, model_id, 0, str(uuid.uuid4())],
+            separators=(",", ":"))
+    except Exception:
+        return None
+
+
 # ─── Utilities ───────────────────────────────────────────────────────────────
 
 def log(msg: str):
-    if CONFIG["log_requests"]:
-        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-        sys.stderr.flush()
+    """Log to stderr AND append to server.log (real-time)."""
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
+    sys.stderr.write(line)
+    sys.stderr.flush()
+    try:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+_AUTH_FIELDS_LOADED = False
 
 
 def load_cookie() -> tuple:
-    """Load cookie from file. Returns (cookie_str, sapisid)."""
+    """Load cookie from file. Returns (cookie_str, sapisid).
+
+    Also supports the gemini-auth.json format exported by the bundled
+    browser extension: {cookie, sapisid, auth_user, xsrf_token, gemini_bl}.
+    Those auth fields are injected into CONFIG on first load, so the user
+    only needs to point cookie_file at the exported json (no manual config
+    edits for xsrf/bl/auth_user).
+    """
+    global _AUTH_FIELDS_LOADED
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file:
         return "", None
@@ -127,6 +273,18 @@ def load_cookie() -> tuple:
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+            # Inject auth metadata from the exported json (one-time).
+            if not _AUTH_FIELDS_LOADED:
+                if data.get("xsrf_token"):
+                    CONFIG["xsrf_token"] = data["xsrf_token"]
+                    log(f"xsrf loaded from auth file (len {len(data['xsrf_token'])})")
+                if data.get("gemini_bl"):
+                    CONFIG["gemini_bl"] = data["gemini_bl"]
+                    log("gemini_bl loaded from auth file")
+                if data.get("auth_user") is not None:
+                    CONFIG["auth_user"] = data["auth_user"]
+                    log(f"auth_user loaded from auth file: {data['auth_user']}")
+                _AUTH_FIELDS_LOADED = True
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
@@ -153,11 +311,53 @@ def account_prefix() -> str:
 
 def apply_chat_persistence_flags(inner: list) -> None:
     """Apply Gemini Web persistence flags to an outgoing request payload."""
-    if CONFIG.get("temporary_chats", False):
+    if CONFIG.get("persistent_chat", False):
+        # Persistent chat: keep the same conversation across requests so Google
+        # can reuse prefix KV cache. This does leave traces in the web UI.
+        inner[41] = [2]
+    elif CONFIG.get("temporary_chats", False):
         inner[41] = [1]
         inner[45] = 1
     else:
         inner[41] = [2]
+
+
+def apply_chat_window(inner: list) -> None:
+    """Inject the active persistent conversation ids into inner[2].
+
+    Protocol (verified): inner[2][0] = conversation id (c_xxx, stable),
+    inner[2][1] = last response id (r_xxx, updates each turn). Leaving both
+    empty starts a brand-new conversation (stateless / no cache reuse).
+    Also keeps inner[59] as a fresh per-request uuid.
+    """
+    if CONFIG.get("persistent_chat", False) and CHAT_WINDOW.active:
+        inner[2] = [CHAT_WINDOW.conv_id, CHAT_WINDOW.resp_id,
+                    "", None, None, None, None, None, None, ""]
+    inner[59] = str(uuid.uuid4())
+
+
+def _capture_session_ids(raw: str) -> None:
+    """Scan a raw StreamGenerate response and store conv_id (c_xxx) and the
+    latest response id (r_xxx) into CHAT_WINDOW for conversation continuation."""
+    if not CONFIG.get("persistent_chat", False):
+        return
+    try:
+        for line in raw.split("\n"):
+            if '"wrb.fr"' not in line:
+                continue
+            arr = json.loads(line)
+            inner_str = arr[0][2]
+            if not inner_str:
+                continue
+            inner2 = json.loads(inner_str)
+            if isinstance(inner2, list) and len(inner2) > 1 and isinstance(inner2[1], list):
+                c = inner2[1][0] if len(inner2[1]) > 0 else None
+                r = inner2[1][1] if len(inner2[1]) > 1 else None
+                if isinstance(c, str) and c.startswith("c_"):
+                    CHAT_WINDOW.update_from_response(c, r if isinstance(r, str) and r.startswith("r_") else None)
+                    break
+    except (json.JSONDecodeError, IndexError, TypeError):
+        pass
 
 
 def fetch_latest_bl() -> Optional[str]:
@@ -194,6 +394,55 @@ def update_bl_if_needed() -> bool:
     return False
 
 
+def fetch_xsrf_token() -> Optional[str]:
+    """Fetch the current xsrf token (SNlM0e) from the signed-in Gemini page.
+
+    MUST send SNlM0e verbatim: it looks like
+        "AIaPT3Nf6-OwMfS0dnpZKG5SHwQ4:1790841775902"
+    i.e. ~28 chars + ':' + a 13-digit timestamp (42 chars total).
+
+    WARNING: FdrFJe is NOT the xsrf token — it is a plain 18/20-digit session
+    id. Sending it as `at=` makes upstream answer
+        [["er",...,400,...,[{"...":["xsrf",
+            "AIaPT3Nf6-OwMfS0dnpZKG5SHwQ4:1790841775902",["<account id>"]]}]]]
+    which is exactly the "HTTP Error 400: Bad Request" seen when the auth file
+    carries no xsrf_token. So SNlM0e is tried first and FdrFJe only remains as a
+    last-resort fallback (kept for older page layouts where it still worked).
+    """
+    try:
+        req = urllib.request.Request(
+            "https://gemini.google.com/app",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Cookie": load_cookie()[0],
+            })
+        ctx = ssl.create_default_context()
+        proxy = CONFIG.get("proxy")
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ctx))
+        resp = opener.open(req, timeout=20)
+        html = resp.read().decode("utf-8", errors="replace")
+        # 首选：完整的 SNlM0e（含冒号与时间戳）
+        m = re.search(r'"SNlM0e"\s*:\s*"([A-Za-z0-9_\-]+:\d{8,})"', html)
+        if m:
+            return m.group(1)
+        # 次选：SNlM0e 可能不带时间戳后缀
+        m2 = re.search(r'"SNlM0e"\s*:\s*"([A-Za-z0-9_\-]{15,})"', html)
+        if m2:
+            return m2.group(1)
+        # 最后兜底：FdrFJe（注意：这只是会话 ID，不是 XSRF token）
+        m3 = re.search(r'"FdrFJe"\s*:\s*"(-?\d+)"', html)
+        if m3:
+            log("WARNING: SNlM0e not found; falling back to FdrFJe (session id, "
+                "not a real xsrf token) — upstream may reject with xsrf 400")
+            return m3.group(1)
+        return None
+    except Exception as e:
+        log(f"xsrf fetch failed: {e}")
+        return None
+
+
 def upload_images(images: list) -> list:
     """Upload parsed OpenAI image parts and return Gemini file references."""
     if not images:
@@ -220,7 +469,8 @@ def upload_images(images: list) -> list:
 
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
-def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
+def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+                           model_name: str = None) -> str:
     """Send prompt to Gemini StreamGenerate with retry."""
     inner = [None] * 80
     if file_refs:
@@ -239,8 +489,8 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     inner[27] = 1
     inner[30] = [4]
     apply_chat_persistence_flags(inner)
+    apply_chat_window(inner)
     inner[53] = 0
-    inner[59] = str(uuid.uuid4())
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
@@ -272,6 +522,9 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    model_hdr = build_model_header(model_name, model_id)
+    if model_hdr:
+        headers["x-goog-ext-525001261-jspb"] = model_hdr
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
@@ -287,7 +540,12 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
                 resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            return resp.read().decode("utf-8", errors="replace")
+            raw = resp.read().decode("utf-8", errors="replace")
+            # Persistent chat: capture c_/r_ ids from the raw response so the
+            # next request continues this conversation (prefix KV cache reuse).
+            if CONFIG.get("persistent_chat", False):
+                _capture_session_ids(raw)
+            return raw
         except urllib.error.HTTPError as e:
             if e.code == 405 and update_bl_if_needed():
                 reqid = int(time.time()) % 1000000
@@ -311,7 +569,8 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     raise last_err
 
 
-def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
+def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+                                model_name: str = None):
     """Send prompt and yield incremental text deltas using httpx streaming."""
     inner = [None] * 80
     if file_refs:
@@ -330,8 +589,8 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     inner[27] = 1
     inner[30] = [4]
     apply_chat_persistence_flags(inner)
+    apply_chat_window(inner)
     inner[53] = 0
-    inner[59] = str(uuid.uuid4())
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
@@ -362,12 +621,15 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    model_hdr = build_model_header(model_name, model_id)
+    if model_hdr:
+        headers["x-goog-ext-525001261-jspb"] = model_hdr
 
     proxy = CONFIG.get("proxy")
 
     if not HAS_HTTPX:
         # Fallback: non-streaming with urllib
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, model_name)
         text = extract_response_text(raw)
         if text:
             yield text
@@ -397,6 +659,18 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                             if not inner_str or len(inner_str) < 50:
                                 continue
                             inner2 = json.loads(inner_str)
+                            # Persistent chat: capture conv_id (c_xxx) and
+                            # response id (r_xxx) so the next request can
+                            # continue this conversation (prefix KV cache).
+                            if CONFIG.get("persistent_chat", False) and isinstance(inner2, list) and len(inner2) > 1 and isinstance(inner2[1], list):
+                                try:
+                                    _c = inner2[1][0] if len(inner2[1]) > 0 else None
+                                    _r = inner2[1][1] if len(inner2[1]) > 1 else None
+                                    if (isinstance(_c, str) and _c.startswith("c_")) or (isinstance(_r, str) and _r.startswith("r_")):
+                                        CHAT_WINDOW.update_from_response(_c if isinstance(_c, str) and _c.startswith("c_") else None,
+                                                                         _r if isinstance(_r, str) and _r.startswith("r_") else None)
+                                except Exception:
+                                    pass
                             if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
                                 for part in inner2[4]:
                                     if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
@@ -516,6 +790,18 @@ def image_from_part(part: dict):
     return None
 
 
+def _truncate_tool_result(content: str, max_len: int = 1200) -> str:
+    """Trim oversized tool results to keep the prompt lean (faster TTFT)."""
+    if not content:
+        return content
+    if len(content) <= max_len:
+        return content
+    head = content[:max_len]
+    # keep a tail snippet for context (e.g. last error line)
+    tail = content[-200:]
+    return f"{head}\n[... truncated by proxy: {len(content) - max_len} chars omitted ...]\n{tail}"
+
+
 def messages_to_prompt(messages: list, tools: list = None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list)."""
     parts = []
@@ -530,13 +816,55 @@ def messages_to_prompt(messages: list, tools: list = None) -> tuple:
                 "parameters": fn.get("parameters", tool.get("parameters", {})),
             })
         if tool_defs:
-            tools_json = json.dumps(tool_defs, indent=2)
-            if len(tools_json) > PROMPT_MAX_BYTES // 2:
-                slim_defs = [{"name": t["name"], "description": t["description"]} for t in tool_defs]
-                tools_json = json.dumps(slim_defs, indent=2)
-                log(f"Tools block too large ({len(tool_defs)} tools), stripped parameters")
+            # ── Tool filter + compact for speed ──────────────────────────
+            # DSH sends 43 tools (~34KB / 8650 tok). The dev_*/job_*/goals
+            # series are rarely needed and bulk up the prompt; core 10 tools
+            # cover 90%+ daily coding. Keep full parameters, trim description
+            # to the first sentence (~150 chars) to preserve call accuracy.
+            CORE_TOOL_NAMES = {
+                'read', 'edit', 'write', 'grep', 'glob', 'pwsh',
+                'web_search', 'todo_write', 'todo_read', 'subagent',
+            }
+            filtered = []
+            skipped = 0
+            for t in tool_defs:
+                if t.get("name", "") in CORE_TOOL_NAMES:
+                    filtered.append(t)
+                else:
+                    skipped += 1
+            if skipped:
+                log(f"Tool filter: {len(tool_defs)} → {len(filtered)} core tools ({skipped} dev/job/goals skipped)")
+            MAX_DESC = 150
+            compact_defs = []
+            for t in filtered:
+                d = t.get("description", "") or ""
+                # Keep the first sentence (usually the core meaning).
+                d = d.split('.')[0].split('\n')[0].strip()
+                if len(d) > MAX_DESC:
+                    d = d[:MAX_DESC].rstrip() + "..."
+                compact_defs.append({
+                    "name": t.get("name", ""),
+                    "description": d,
+                    "parameters": t.get("parameters", {}),
+                })
+            TOOLS_BUDGET = PROMPT_MAX_BYTES * 3 // 4
+            tools_json = json.dumps(compact_defs, ensure_ascii=False, separators=(",", ":"))
+            try:
+                sizes = sorted(((len(json.dumps(t, ensure_ascii=False, separators=(",",":"))), t.get("name","")) for t in compact_defs), reverse=True)
+                top = ", ".join(f"{n}({s}B)" for s, n in sizes[:5])
+                log(f"Tools: {len(compact_defs)} core, {len(tools_json)}B | {top}")
+            except Exception:
+                pass
+            if len(tools_json) > TOOLS_BUDGET:
+                slim_defs = [{"name": t["name"], "parameters": t["parameters"]} for t in compact_defs]
+                tools_json = json.dumps(slim_defs, ensure_ascii=False, separators=(",", ":"))
+                log(f"Tools block too large ({len(compact_defs)} tools), stripped descriptions only")
             parts.append(
-                "[System instruction]: You have access to tools. "
+                "[System instruction]: You are a coding agent with real tools available. "
+                "When the user asks you to CREATE files, WRITE code, EDIT files, "
+                "SEARCH the web, RUN commands, or MANAGE tasks — you MUST call the "
+                "appropriate tool. Do NOT simply describe what you would do in text; "
+                "actually invoke the tool. If no tool is needed, answer directly.\n\n"
                 "To call a tool, respond with:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "Only use tool_call blocks when needed.\n\n"
@@ -571,7 +899,7 @@ def messages_to_prompt(messages: list, tools: list = None) -> tuple:
             else:
                 parts.append(f"[Assistant]: {content}")
         elif role == "tool":
-            parts.append(f"[Tool result for {msg.get('name', '')}]: {content}")
+            parts.append(f"[Tool result for {msg.get('name', '')}]: {_truncate_tool_result(content)}")
         else:
             parts.append(content if content else "")
     return "\n\n".join(p for p in parts if p), images
@@ -639,6 +967,11 @@ def parse_tool_calls(text: str) -> tuple:
 # ─── HTTP Handler ────────────────────────────────────────────────────────────
 
 class GeminiHandler(BaseHTTPRequestHandler):
+    # HTTP/1.0 + connection-close: SSE streams end when the connection closes
+    # (EOF). HTTP/1.1 without chunked encoding makes clients wait forever for
+    # a body terminator that BaseHTTPRequestHandler never sends.
+    protocol_version = "HTTP/1.0"
+
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
@@ -651,6 +984,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_stream_headers(self):
+        """SSE headers with proxy-buffering disabled for smooth streaming."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+    @staticmethod
+    def _usage_chunk(cid, model_name, prompt, full_text):
+        """Build OpenAI-style usage chunk so DSH usage plugin can count tokens."""
+        p_tokens = max(1, len(prompt) // 4)
+        c_tokens = max(1, len(full_text) // 4)
+        return {
+            "id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+            "model": model_name, "choices": [],
+            "usage": {"prompt_tokens": p_tokens, "completion_tokens": c_tokens,
+                      "total_tokens": p_tokens + c_tokens},
+        }
 
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
@@ -715,6 +1069,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_google_generate(body, stream=True)
             elif ":generateContent" in self.path:
                 self._handle_google_generate(body, stream=False)
+            elif self.path == "/messages" or self.path.endswith("/messages"):
+                self._handle_search(body)
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -762,8 +1118,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return None, None, None, f"Unknown model: {model_name}"
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
-    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None, model_name=None):
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, model_name)
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
@@ -772,6 +1128,49 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def handle_chat(self, body: bytes):
         req = json.loads(body)
+        # Debug: export the real DSH tools JSON once (for prompt-size analysis)
+        try:
+            _tools = req.get("tools")
+            if _tools and len(_tools) >= 40:
+                out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dsh-tools-real.json")
+                if not os.path.exists(out):
+                    with open(out, "w", encoding="utf-8") as f:
+                        json.dump(_tools, f, ensure_ascii=False, indent=1)
+                    log(f"Exported {len(_tools)} DSH tools to dsh-tools-real.json")
+        except Exception:
+            pass
+        # Debug: log request structure that DSH sends (one-time diagnostic)
+        try:
+            msgs = req.get("messages", [])
+            roles = [m.get("role") for m in msgs]
+            last3 = []
+            for m in msgs[-3:]:
+                c = m.get("content")
+                if c is None:
+                    cstr = "<None>"
+                elif isinstance(c, str):
+                    cstr = c[:50]
+                elif isinstance(c, list):
+                    cstr = f"<list:{len(c)}>"
+                else:
+                    cstr = repr(c)[:50]
+                tcs = f" tc={len(m.get('tool_calls', []))}" if m.get("tool_calls") else ""
+                last3.append(f"{m.get('role')}:{cstr}{tcs}")
+            log(f"DSH-REQ: keys={list(req.keys())} stream={req.get('stream')} "
+                f"stream_options={req.get('stream_options')} tool_choice={req.get('tool_choice')} "
+                f"msgs={len(msgs)} roles={roles[:5]}... last3={last3}")
+        except Exception as e:
+            log(f"DSH-REQ debug err: {e}")
+        # Persistent chat: resolve the shared Gemini conversation from the
+        # message window (same chat across requests => Google prefix KV cache
+        # reuse). The conv/resp ids from the last response are injected into
+        # inner[2] by the request builders; when persistent_chat is off the
+        # window is not consulted and every request is stateless (fresh chat).
+        try:
+            if CONFIG.get("persistent_chat", False):
+                CHAT_WINDOW.resolve(len(req.get("messages", [])))
+        except Exception as e:
+            log(f"ChatWindow resolve err: {e}")
         model_name, model_id, think_mode, err = self._resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
@@ -779,12 +1178,78 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tools = req.get("tools")
-        prompt, images = messages_to_prompt(req.get("messages", []), tools)
+        all_msgs = req.get("messages", [])
+        # ── Pure-incremental persistent chat ─────────────────────────────
+        # persistent_chat=true + an ongoing window: only the messages added
+        # since the last successfully-sent request are forwarded to Gemini
+        # (Google's server keeps the conversation memory via conv_id). The
+        # first request of a window sends everything (system + tools + history)
+        # to seed the conversation.
+        persist_mode = CONFIG.get("persistent_chat", False)
+        if persist_mode and not CHAT_WINDOW.is_new_window and CHAT_WINDOW.active and CHAT_WINDOW.sent_msg_count > 0:
+            start = CHAT_WINDOW.sent_msg_count
+            if len(all_msgs) > start:
+                send_msgs = all_msgs[start:]
+                prompt, images = messages_to_prompt(send_msgs, None)  # no tool re-injection
+                log(f"Persist-incremental: {len(send_msgs)} new msgs (of {len(all_msgs)}), sent_idx={start}")
+            else:
+                # Nothing genuinely new (retry of a failed turn): fall back to
+                # full send to be safe.
+                prompt, images = messages_to_prompt(all_msgs, tools)
+                log(f"Persist-incremental: no new msgs, fallback full ({len(all_msgs)})")
+        else:
+            prompt, images = messages_to_prompt(all_msgs, tools)
+        # PROMPT-STATS: structured breakdown of what goes into the prompt
+        # (which roles / how many / char counts / est. tokens). Content is NOT
+        # printed — only sizes — so it's cheap and stays readable.
+        try:
+            msgs = req.get("messages", [])
+            role_counts = {}
+            sys_chars = user_chars = asst_chars = tool_chars = 0
+            for m in msgs:
+                r = m.get("role", "?")
+                role_counts[r] = role_counts.get(r, 0) + 1
+                c = m.get("content")
+                n = len(c) if isinstance(c, str) else (sum(len(p.get("text", "")) for p in c if isinstance(p, dict) and isinstance(p.get("text"), str)) if isinstance(c, list) else 0)
+                if r == "system": sys_chars += n
+                elif r == "user": user_chars += n
+                elif r == "assistant": asst_chars += n
+                elif r == "tool": tool_chars += n
+            tools_json_chars = 0
+            if tools:
+                try:
+                    _compact = [{"name": t.get("name", ""), "description": (t.get("description", "") or "")[:150], "parameters": t.get("parameters", {})} for t in tools]
+                    tools_json_chars = len(json.dumps(_compact, ensure_ascii=False, separators=(",", ":")))
+                except Exception:
+                    pass
+            prompt_chars = len(prompt)
+            est_tok = prompt_chars // 4
+            log(f"PROMPT-STATS: msgs={len(msgs)} roles={role_counts} | "
+                f"sys={sys_chars}B user={user_chars}B asst={asst_chars}B tool={tool_chars}B "
+                f"tools_json={tools_json_chars}B | prompt_total={prompt_chars}B (~{est_tok} tok)")
+        except Exception as e:
+            log(f"PROMPT-STATS err: {e}")
+        # Global prompt budget: keep the head (system/tools + early context) and
+        # the tail (recent turns), collapse the middle to keep TTFT low.
+        # Set high enough that tool definitions (32KB for DSH's 43 tools) are
+        # never clipped; conversation history is trimmed separately in
+        # messages_to_prompt via _truncate_tool_result.
+        MAX_PROMPT = 60000  # ~15k tokens
+        if len(prompt) > MAX_PROMPT:
+            head = prompt[:MAX_PROMPT * 3 // 4]
+            tail = prompt[-MAX_PROMPT // 4:]
+            prompt = f"{head}\n[... proxy: middle of prompt collapsed ...]\n{tail}"
+            log(f"Prompt collapsed: {len(prompt)}B")
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
+        # Record the total msg count so the persistent-window counter advances
+        # only after a successful upstream response (confirm_sent via update_from_response).
+        if persist_mode:
+            CHAT_WINDOW.mark_request_sent(len(all_msgs))
 
         stream = req.get("stream", False)
+        log(f"REQ: stream={stream} tools={len(tools) if tools else 0} model={model_name} prompt_bytes={len(prompt.encode('utf-8'))}")
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         try:
             file_refs = upload_images(images)
@@ -794,16 +1259,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and not tools:
             # True streaming: forward chunks as they arrive
+            self._send_stream_headers()
             try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
+                full_text = ""
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs):
+                self.wfile.flush()
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, model_name):
+                    full_text += delta_text
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -812,6 +1276,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                          "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                # Usage chunk for DSH usage plugin
+                usage = self._usage_chunk(cid, model_name, prompt, full_text)
+                self.wfile.write(f"data: {json.dumps(usage, ensure_ascii=False)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
@@ -820,9 +1287,117 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 log(f"Stream error: {e}")
             return
 
+        if stream and tools:
+            # True streaming WITH tools: stream plain text as it arrives (fast
+            # TTFT), but buffer ```tool_call JSON blocks so they are NOT leaked
+            # into content — emit parsed tool_calls delta at the end instead.
+            # (Leaking the JSON into content makes clients like DSH treat the
+            #  turn as a text reply and never execute the tool.)
+            self._send_stream_headers()
+            try:
+                first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                               "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+                self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
+                self.wfile.flush()
+
+                TOOL_START = "```tool_call"
+                TOOL_END = "\n```"
+                pending = ""          # text not yet classified
+                in_tool = False
+                tool_calls = []
+                full_text = ""        # full raw text (for usage estimate)
+                text_sent = ""        # text streamed as content
+
+                def send_content(txt):
+                    if not txt:
+                        return
+                    nonlocal text_sent
+                    text_sent += txt
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                             "model": model_name, "choices": [{"index": 0, "delta": {"content": txt}, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+
+                def parse_block(block_text):
+                    """Parse one ```tool_call JSON block into a tool call dict."""
+                    try:
+                        data = json.loads(block_text.strip())
+                        return {
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {
+                                "name": data["name"],
+                                "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
+                            },
+                        }
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        return None
+
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, model_name):
+                    full_text += delta_text
+                    pending += delta_text
+                    # Process the pending buffer until it stabilizes (no
+                    # tool block open and no new one started).
+                    stable = False
+                    while not stable:
+                        stable = True
+                        if not in_tool:
+                            idx = pending.find(TOOL_START)
+                            if idx >= 0:
+                                send_content(pending[:idx])
+                                pending = pending[idx:]
+                                in_tool = True
+                                stable = False
+                            else:
+                                # Stream all but a tail that could become the
+                                # tool block opener (cross-chunk safety).
+                                keep = min(len(pending), len(TOOL_START) - 1)
+                                if len(pending) > keep:
+                                    send_content(pending[:-keep] if keep else pending)
+                                    pending = pending[-keep:] if keep else ""
+                        else:
+                            # Try to close the open tool block right away.
+                            end_idx = pending.find(TOOL_END, len(TOOL_START))
+                            if end_idx >= 0:
+                                block = pending[len(TOOL_START):end_idx]
+                                tc = parse_block(block)
+                                if tc:
+                                    tool_calls.append(tc)
+                                pending = pending[end_idx + len(TOOL_END):]
+                                in_tool = False
+                                stable = False
+                # Any remaining plain text after the loop.
+                if pending and not in_tool:
+                    send_content(pending)
+                elif pending and in_tool:
+                    # Unterminated tool block: drop it from content.
+                    log(f"Unterminated tool block, dropped {len(pending)}B")
+
+                # Final chunk: emit tool_calls (if any) + finish_reason.
+                if tool_calls:
+                    msg = {"role": "assistant", "content": text_sent or None, "tool_calls": tool_calls}
+                    finish = "tool_calls"
+                else:
+                    msg = {}
+                    finish = "stop"
+                final_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                               "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
+                self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
+                # Usage chunk for DSH usage plugin
+                usage = self._usage_chunk(cid, model_name, prompt, full_text)
+                self.wfile.write(f"data: {json.dumps(usage, ensure_ascii=False)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                log(f"STREAM-COMPLETE: {cid} finish={finish} text={len(text_sent)}B tools={len(tool_calls)} raw={full_text[:120]!r}")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Stream tool error: {e}")
+            return
+
         # Non-streaming (or tool calling which needs full response)
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs, model_name)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -833,15 +1408,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
         finish = "tool_calls" if tool_calls else "stop"
 
         if stream:
-            # Stream mode with tools: send as single chunk (need full parse for tool_calls)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
+            # Stream mode with tools: full response as delta (tool_calls parsed), then usage
+            self._send_stream_headers()
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                      "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+            # Usage chunk for DSH usage plugin
+            usage = self._usage_chunk(cid, model_name, prompt, text)
+            self.wfile.write(f"data: {json.dumps(usage, ensure_ascii=False)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         else:
@@ -852,6 +1426,162 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text)//4,
                           "total_tokens": (len(prompt)+len(text))//4},
             })
+
+    def _handle_search(self, body: bytes):
+        """Handle Anthropic Messages API requests for DSH web_search.
+        
+        When DSH's web-search-deepseek provider is configured with
+        baseURL=http://127.0.0.1:8081, it sends requests to /messages in
+        Anthropic format. This method routes them through Gemini Web's
+        native search capability (free) instead of DeepSeek API (paid).
+        
+        Retry: one retry on failure, then return error to DSH for its own retry.
+        """
+        req = json.loads(body)
+        # Extract search query from Anthropic Messages format
+        msgs = req.get("messages", [])
+        query = ""
+        for m in msgs:
+            c = m.get("content", "")
+            if isinstance(c, str):
+                query = c
+                break
+            elif isinstance(c, list):
+                for part in c:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        query = part.get("text", "")
+                        break
+        if not query:
+            for t in req.get("tools", []):
+                q = t.get("queries", []) if isinstance(t, dict) else []
+                if q:
+                    query = ", ".join(q)
+                    break
+        if not query:
+            query = req.get("content", "")
+
+        log(f"[Search] query: {query[:80]}")
+        result_text = self._execute_search(query)
+        
+        # Return Anthropic Messages API format
+        response = {
+            "id": f"msg_{uuid.uuid4().hex[:12]}",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": result_text}],
+            "model": req.get("model", "gemini-3.8-flash"),
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": len(query) // 4, "output_tokens": len(result_text) // 4},
+        }
+        self.send_json(response)
+        log(f"[Search] done: {len(result_text)}B result")
+
+    def _execute_search(self, query: str) -> str:
+        """Execute search via Gemini Web RPC with retry.
+        
+        Returns formatted search result text, or error message.
+        """
+        max_retries = 1
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                cookie_str, sapisid = load_cookie()
+                if not cookie_str:
+                    last_error = "No cookie loaded"
+                    continue
+                
+                xsrf = CONFIG.get("xsrf_token") or ""
+                bl = CONFIG.get("gemini_bl")
+                if not bl:
+                    last_error = "No gemini_bl"
+                    continue
+                
+                search_prompt = (
+                    f"Please use Google Search to find information about: {query}\n"
+                    f"Search for the latest information on this topic and provide:\n"
+                    f"1. A brief summary of the search results\n"
+                    f"2. Key facts and details\n"
+                    f"3. Relevant source URLs if available"
+                )
+                
+                inner = [None] * 80
+                inner[0] = [search_prompt, 0, None, None, None, None, 0]
+                inner[1] = ["en"]
+                inner[2] = ["", "", "", None, None, None, None, None, None, ""]
+                inner[6] = [0]
+                inner[7] = 1
+                inner[10] = 1
+                inner[11] = 0
+                inner[17] = [[0]]  # think=0 for fast search
+                inner[18] = 0
+                inner[27] = 1
+                inner[30] = [4]
+                inner[41] = [1]  # temporary chats for search
+                inner[45] = 1
+                inner[53] = 0
+                inner[59] = str(uuid.uuid4())
+                inner[61] = []
+                inner[68] = 1
+                inner[79] = 1  # model_id for 3.8-flash
+
+                params = {"f.req": json.dumps([None, json.dumps(inner)])}
+                if xsrf:
+                    params["at"] = xsrf
+                body = urllib.parse.urlencode(params).encode()
+                reqid = int(time.time()) % 1000000
+                prefix = account_prefix()
+                url = (
+                    f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
+                    "assistant.lamda.BardFrontendService/StreamGenerate"
+                    f"?bl={bl}&hl=en&_reqid={reqid}&rt=c"
+                )
+                headers = {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://gemini.google.com",
+                    "Referer": f"https://gemini.google.com{prefix}/app",
+                    "X-Same-Domain": "1",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Cookie": cookie_str,
+                }
+                if CONFIG.get("auth_user") is not None:
+                    headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+                if sapisid:
+                    ts = int(time.time())
+                    h = hashlib.sha1(f"{ts} {sapisid} https://gemini.google.com".encode()).hexdigest()
+                    headers["Authorization"] = f"SAPISIDHASH {ts}_{h}"
+                model_hdr = build_model_header("gemini-3.8-flash", 1)
+                if model_hdr:
+                    headers["x-goog-ext-525001261-jspb"] = model_hdr
+
+                proxy_url = CONFIG.get("proxy")
+                ctx = ssl.create_default_context()
+                if proxy_url:
+                    opener = urllib.request.build_opener(
+                        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}),
+                        urllib.request.HTTPSHandler(context=ctx))
+                else:
+                    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+
+                t0 = time.time()
+                resp = opener.open(urllib.request.Request(url, data=body, headers=headers, method="POST"),
+                                   timeout=CONFIG.get("request_timeout_sec", 60))
+                raw = resp.read().decode("utf-8", errors="replace")
+                latency = int((time.time() - t0) * 1000)
+
+                text = extract_response_text(raw)
+                if text:
+                    log(f"[Search] {query[:40]}... → {len(text)}B ({latency}ms) attempt={attempt}")
+                    return text
+                else:
+                    last_error = f"Empty response"
+            except Exception as e:
+                last_error = str(e)
+            
+            if attempt < max_retries:
+                log(f"[Search] retry {attempt + 1}: {last_error}")
+                time.sleep(1)
+
+        return f"[Search failed after {max_retries + 1} attempts: {last_error}]"
 
     def handle_responses(self, body: bytes):
         """OpenAI Responses API for Codex CLI compatibility."""
@@ -1080,6 +1810,16 @@ def main():
     new_bl = fetch_latest_bl()
     if new_bl:
         CONFIG["gemini_bl"] = new_bl
+
+    if not CONFIG.get("xsrf_token"):
+        tok = fetch_xsrf_token()
+        # fetch_xsrf_token() calls load_cookie() internally, which may have just
+        # injected xsrf from the auth json file. Don't clobber that with the
+        # auto-fetched value — the auth-file value (SNlM0e) is the authoritative
+        # one the page expects as the `at` form field.
+        if tok and not CONFIG.get("xsrf_token"):
+            CONFIG["xsrf_token"] = tok
+            log(f"xsrf auto-fetched (len {len(tok)})")
 
     class ThreadedServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True

@@ -406,3 +406,45 @@ exportButton.addEventListener("click", async () => {
     exportButton.disabled = false;
   }
 });
+
+// ============ v2: 自动同步（native host）============
+const forceSyncButton = document.getElementById("force-sync");
+const syncStatusEl = document.getElementById("sync-status");
+
+function setSyncStatus(message, kind = "") {
+  if (!syncStatusEl) return;
+  syncStatusEl.textContent = "自动同步: " + message;
+  syncStatusEl.className = kind;
+}
+
+async function refreshSyncStatus() {
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: "get-sync-status" });
+    if (resp) {
+      const connected = resp.hostConnected;
+      setSyncStatus(
+        (connected ? "✅ 已连接 native host" : "⚠️ native host 未连接（先运行 install-host.ps1）"),
+        connected ? "ok" : "warn"
+      );
+    }
+  } catch (e) {
+    setSyncStatus("查询失败", "warn");
+  }
+}
+
+forceSyncButton?.addEventListener("click", async () => {
+  forceSyncButton.disabled = true;
+  setSyncStatus("同步中…");
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: "force-sync" });
+    if (resp?.ok) setSyncStatus("✅ 已推送到本地 gemini-auth.json", "ok");
+    else setSyncStatus("❌ 推送失败", "warn");
+  } catch (e) {
+    setSyncStatus("❌ " + String(e), "warn");
+  } finally {
+    forceSyncButton.disabled = false;
+  }
+});
+
+void refreshSyncStatus();
+setInterval(refreshSyncStatus, 3000);

@@ -1,18 +1,24 @@
 {
   "manifest_version": 3,
   "name": "Gemini Cookie Sync",
-  "version": "1.0",
-  "description": "Exports Gemini cookies plus XSRF/build metadata for gemini-web2api.",
+  "version": "2.0",
+  "description": "Exports Gemini cookies plus XSRF/build metadata for gemini-web2api. Auto-syncs to native host when session cookies rotate.",
   "permissions": [
     "cookies",
     "downloads",
     "tabs",
-    "scripting"
+    "scripting",
+    "nativeMessaging",
+    "alarms"
   ],
   "host_permissions": [
     "https://google.com/*",
-    "https://*.google.com/*"
+    "https://*.google.com/*",
+    "https://gemini.google.com/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_title": "Gemini Cookie Sync",
     "default_popup": "popup.html"

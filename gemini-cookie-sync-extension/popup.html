@@ -50,6 +50,8 @@
   <button id="open" type="button">Open Gemini</button>
   <button id="inspect" type="button">Inspect session</button>
   <button id="export" type="button">Export gemini-auth.json</button>
+  <button id="force-sync" type="button" style="background:#17823b;color:white">立即自动同步到本地</button>
+  <p id="sync-status" class="note" style="margin-top:10px;padding:8px;border-radius:6px;background:color-mix(in srgb, CanvasText 6%, Canvas)">自动同步: 检测中…</p>
   <p id="status">Ready.</p>
   <p class="note">Open Gemini, sign in, then refresh the page before inspection. The generated file contains highly sensitive session data; do not share it or commit it to Git.</p>
   <script src="popup.js"></script>

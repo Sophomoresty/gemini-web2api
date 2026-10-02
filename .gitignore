@@ -7,3 +7,29 @@ cookie.json
 .idea
 .DS_Store
 gemini-auth.json
+
+# ---- 本机运行期产物（不应提交）----
+# 项目内依赖（httpx 等，约 21MB）
+.deps/
+# 服务与守护的日志 / 状态 / PID
+server.log
+server.log.err
+server.pid
+watchdog.log
+watchdog.log.1
+watchdog.state.json
+watchdog.pid
+watchdog.pause
+# 本机专用工具与数据（不属于上游仓库）
+dsh-tools-real.json
+gemini_search.py
+manage.ps1
+start.bat
+watchdog.py
+watchdog.ps1
+README.接入指南.md
+
+# ---- 说明 ----
+# manage.ps1 / start.bat / watchdog.py|ps1 是本机管理脚本，
+# 规范的副本在 dsh-gemini-web2api-toolkit 仓库的 scripts/ 下，
+# 故此处不纳入本（上游 fork 的）仓库。
