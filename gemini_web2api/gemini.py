@@ -36,12 +36,20 @@ def _get_ssl_ctx():
     return _ssl_ctx
 
 
+def _idle_timeout() -> float:
+    """Max seconds to wait between bytes from Gemini before retrying.
+
+    Falls back to request_timeout_sec when idle_timeout_sec is unset."""
+    return CONFIG.get("idle_timeout_sec") or CONFIG["request_timeout_sec"]
+
+
 def _get_httpx_client():
     global _httpx_client
     if _httpx_client is None and HAS_HTTPX:
         proxy = CONFIG.get("proxy")
         transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        timeout = httpx.Timeout(CONFIG["request_timeout_sec"], read=_idle_timeout())
+        _httpx_client = httpx.Client(transport=transport, timeout=timeout, verify=True)
     return _httpx_client
 
 
@@ -219,9 +227,9 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                     urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                     urllib.request.HTTPSHandler(context=ctx)
                 )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+                resp = opener.open(req, timeout=_idle_timeout())
             else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+                resp = urllib.request.urlopen(req, context=ctx, timeout=_idle_timeout())
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
         except Exception as e:
@@ -274,6 +282,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             return
         except Exception as e:
             last_err = e
+            if emitted_raw_text:
+                # Text was already yielded; a fresh generation cannot continue it
+                # (Gemini output is not deterministic). Let the caller decide.
+                raise
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])

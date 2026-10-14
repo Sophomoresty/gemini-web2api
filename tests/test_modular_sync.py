@@ -348,8 +348,8 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "text/event-stream")
         self.assertIn('"text": "streamed"', body)
 
-    @mock.patch("gemini_web2api.server.generate", return_value="hello")
-    def test_responses_text_stream_has_complete_event_sequence(self, _generate):
+    @mock.patch("gemini_web2api.server.generate_stream", side_effect=lambda *a, **k: iter(["hello"]))
+    def test_responses_text_stream_has_complete_event_sequence(self, _generate_stream):
         status, headers, body = self.post_json(
             "/v1/responses",
             {
@@ -384,21 +384,13 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[-1][1]["response"]["status"], "completed")
         self.assertEqual(events[-1][1]["response"]["output"][0]["content"][0]["text"], "hello")
 
-    @mock.patch("gemini_web2api.server.parse_tool_calls")
-    @mock.patch("gemini_web2api.server.generate", return_value="tool output")
-    def test_responses_function_call_stream_has_complete_event_sequence(
-        self, _generate, parse_tool_calls
-    ):
-        parse_tool_calls.return_value = (
-            "",
-            [
-                {
-                    "id": "call_test",
-                    "type": "function",
-                    "function": {"name": "get_weather", "arguments": '{"city":"Shanghai"}'},
-                }
-            ],
-        )
+    @mock.patch(
+        "gemini_web2api.server.generate_stream",
+        side_effect=lambda *a, **k: iter(
+            ['```tool_call\n{"name": "get_weather", "arguments": {"city": "Shanghai"}}\n```']
+        ),
+    )
+    def test_responses_function_call_stream_has_complete_event_sequence(self, _generate_stream):
 
         status, _, body = self.post_json(
             "/v1/responses",
@@ -436,8 +428,8 @@ class StreamingEndpointTests(unittest.TestCase):
             list(range(1, len(events) + 1)),
         )
         self.assertEqual(events[2][1]["output_index"], 0)
-        self.assertEqual(events[3][1]["delta"], '{"city":"Shanghai"}')
-        self.assertEqual(events[4][1]["arguments"], '{"city":"Shanghai"}')
+        self.assertEqual(json.loads(events[3][1]["delta"]), {"city": "Shanghai"})
+        self.assertEqual(json.loads(events[4][1]["arguments"]), {"city": "Shanghai"})
         self.assertEqual(events[-1][1]["response"]["output"][0]["name"], "get_weather")
 
 
