@@ -7,12 +7,19 @@
     "cookies",
     "downloads",
     "tabs",
-    "scripting"
+    "scripting",
+    "alarms",
+    "storage",
+    "webRequest"
   ],
   "host_permissions": [
     "https://google.com/*",
-    "https://*.google.com/*"
+    "https://*.google.com/*",
+    "http://127.0.0.1/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_title": "Gemini Cookie Sync",
     "default_popup": "popup.html"

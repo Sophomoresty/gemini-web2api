@@ -1,4 +1,5 @@
 """HTTP server: OpenAI-compatible API endpoints."""
+import ipaddress
 import json
 import time
 import uuid
@@ -8,10 +9,18 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import generate, generate_stream, log, update_cookie_payload
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
+
+
+def _is_loopback(ip_str: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return addr.is_loopback or bool(getattr(addr, "ipv4_mapped", None) and addr.ipv4_mapped.is_loopback)
+    except ValueError:
+        return False
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -116,6 +125,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return False
 
     def do_OPTIONS(self):
+        if self.path.split("?", 1)[0] == "/v1/cookies":
+            origin = self.headers.get("Origin", "")
+            if not origin.startswith("chrome-extension://"):
+                self.send_response(403)
+                self.end_headers()
+                return
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Gemini-Cookie-Sync")
+            self.end_headers()
+            return
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -156,6 +177,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_chat(body)
             elif self.path == "/v1/responses":
                 self._handle_responses(body)
+            elif self.path == "/v1/cookies":
+                self._handle_update_cookies(body)
             elif ":streamGenerateContent" in self.path:
                 self._handle_google_generate(body, stream=True)
             elif ":generateContent" in self.path:
@@ -170,6 +193,37 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": {"message": str(e)}}, 500)
             except:
                 pass
+
+    # ─── /v1/cookies ──────────────────────────────────────────────────────────
+
+    def _cookie_sync_allowed(self) -> bool:
+        origin = self.headers.get("Origin", "")
+        if origin and not origin.startswith("chrome-extension://"):
+            return False
+        if self.headers.get("X-Gemini-Cookie-Sync") != "1":
+            return False
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+        if host and host not in ("127.0.0.1", "localhost", "::1"):
+            return False
+        if not (CONFIG.get("api_keys") or []):
+            client_ip = self.client_address[0] if self.client_address else ""
+            if not _is_loopback(client_ip):
+                return False
+        return True
+
+    def _handle_update_cookies(self, body: bytes):
+        if not self._cookie_sync_allowed():
+            self.send_json({"error": {"message": "forbidden cookie sync request"}}, 403)
+            return
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        ok, err_msg, status = update_cookie_payload(req)
+        if not ok:
+            self.send_json({"error": {"message": err_msg}}, status)
+            return
+        self.send_json({"status": "ok"})
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
 

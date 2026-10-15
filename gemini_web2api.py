@@ -31,6 +31,8 @@ import re
 import os
 import hashlib
 import argparse
+import tempfile
+import threading
 import base64
 import binascii
 from typing import Optional
@@ -62,6 +64,7 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "model_tickets": {},
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -113,28 +116,157 @@ def log(msg: str):
         sys.stderr.flush()
 
 
+_cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
+_cookie_lock = threading.Lock()
+_LOOPBACK_ADDRS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+
+
+def _extract_sapisid(cookie_str: str) -> str:
+    if not cookie_str:
+        return ""
+    m = re.search(r"(?:^|;\s*)SAPISID=([^;\s]+)", cookie_str)
+    return m.group(1) if m else ""
+
+
+def _normalize_model_tickets(raw_tickets) -> dict:
+    if not isinstance(raw_tickets, dict):
+        return {}
+    clean = {}
+    for mk, mv in raw_tickets.items():
+        if len(clean) >= 32:
+            break
+        if (
+            isinstance(mk, str)
+            and isinstance(mv, str)
+            and re.fullmatch(r"gemini-[a-z0-9._-]{1,48}", mk.strip())
+            and re.fullmatch(r"[0-9a-fA-F]{16}", mv.strip())
+        ):
+            clean[mk.strip()] = mv.strip().lower()
+    return clean
+
+
+def _normalize_metadata(data: dict) -> dict:
+    meta = {}
+    for k in ("xsrf_token", "gemini_bl"):
+        val = data.get(k)
+        if isinstance(val, str) and val.strip() and not any(c in val for c in "\r\n\x00"):
+            meta[k] = val.strip()
+    au = data.get("auth_user")
+    if isinstance(au, (int, str)) and not isinstance(au, bool) and str(au).strip().isdigit():
+        meta["auth_user"] = str(au).strip()
+    tickets = _normalize_model_tickets(data.get("model_tickets"))
+    if tickets:
+        meta["model_tickets"] = tickets
+    return meta
+
+
+def update_cookie_payload(data: dict) -> tuple:
+    """Validate and apply a pushed cookie payload. Returns (ok: bool, err_msg: str, status: int)."""
+    if not isinstance(data, dict):
+        return False, "invalid JSON object", 400
+    raw_cookie = data.get("cookie")
+    if not isinstance(raw_cookie, str) or not raw_cookie.strip():
+        return False, "missing or invalid cookie field", 400
+    cookie_str = raw_cookie.strip()
+    if len(cookie_str) > 16384 or any(c in cookie_str for c in "\r\n\x00"):
+        return False, "invalid characters or length in cookie field", 400
+    sapisid = _extract_sapisid(cookie_str)
+    meta = _normalize_metadata(data)
+
+    with _cookie_lock:
+        same_cookie = cookie_str == _cookie_cache.get("str") and (sapisid or None) == _cookie_cache.get("sapisid")
+        cur_tickets = dict(CONFIG.get("model_tickets") or {})
+        new_tickets = meta.get("model_tickets") or {}
+        tickets_changed = any(cur_tickets.get(k) != v for k, v in new_tickets.items())
+        scalar_changed = any(meta.get(k) != CONFIG.get(k) for k in meta if k != "model_tickets")
+        has_new_meta = scalar_changed or tickets_changed
+        if same_cookie and not has_new_meta:
+            return True, "", 200
+
+        merged_tickets = dict(cur_tickets)
+        merged_tickets.update(new_tickets)
+
+        cf = CONFIG.get("cookie_file")
+        mtime = _cookie_cache["mtime"]
+        if cf:
+            tmp_path = None
+            try:
+                existing = {}
+                if os.path.exists(cf):
+                    with open(cf, "r", encoding="utf-8-sig") as rf:
+                        raw_existing = rf.read().strip()
+                    if raw_existing.startswith("{"):
+                        loaded = json.loads(raw_existing)
+                        if isinstance(loaded, dict):
+                            existing = loaded
+                existing["cookie"] = cookie_str
+                if sapisid:
+                    existing["sapisid"] = sapisid
+                disk_tickets = _normalize_model_tickets(existing.get("model_tickets"))
+                if disk_tickets or merged_tickets:
+                    combined = dict(cur_tickets)
+                    combined.update(disk_tickets)
+                    combined.update(new_tickets)
+                    merged_tickets = _normalize_model_tickets(combined)
+                    existing["model_tickets"] = merged_tickets
+                for k, v in meta.items():
+                    if k != "model_tickets":
+                        existing[k] = v
+                parent_dir = os.path.dirname(os.path.abspath(cf)) or "."
+                fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix=".cookie-", suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as wf:
+                    json.dump(existing, wf, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, cf)
+                tmp_path = None
+                mtime = os.path.getmtime(cf)
+            except Exception as e:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                log(f"Cookie persist error: {e}")
+                return False, "failed to persist cookie file", 500
+
+        for k, v in meta.items():
+            if k != "model_tickets":
+                CONFIG[k] = v
+        if merged_tickets:
+            CONFIG["model_tickets"] = merged_tickets
+        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+        log("Updated cookies via /v1/cookies")
+        return True, "", 200
+
+
 def load_cookie() -> tuple:
     """Load cookie from file. Returns (cookie_str, sapisid)."""
-    cookie_file = CONFIG.get("cookie_file")
-    if not cookie_file:
-        return "", None
-    if not os.path.exists(cookie_file):
-        return "", None
-    try:
-        with open(cookie_file, "r") as f:
-            content = f.read().strip()
-        if content.startswith("{"):
-            data = json.loads(content)
-            cookie_str = data.get("cookie", "")
-            sapisid = data.get("sapisid", "")
-        else:
-            cookie_str = content
-            pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
-            sapisid = pairs.get("SAPISID", "")
-        return cookie_str, sapisid if sapisid else None
-    except Exception as e:
-        log(f"Cookie load error: {e}")
-        return "", None
+    with _cookie_lock:
+        cookie_file = CONFIG.get("cookie_file")
+        if not cookie_file or not os.path.exists(cookie_file):
+            return _cookie_cache["str"], _cookie_cache["sapisid"]
+        try:
+            mtime = os.path.getmtime(cookie_file)
+            if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+                return _cookie_cache["str"], _cookie_cache["sapisid"]
+            with open(cookie_file, "r", encoding="utf-8-sig") as f:
+                content = f.read().strip()
+            if content.startswith("{"):
+                data = json.loads(content)
+                cookie_str = data.get("cookie", "")
+                sapisid = data.get("sapisid", "") or _extract_sapisid(cookie_str)
+                meta = _normalize_metadata(data)
+                if "model_tickets" in meta:
+                    cur_tickets = dict(CONFIG.get("model_tickets") or {})
+                    cur_tickets.update(meta["model_tickets"])
+                    CONFIG["model_tickets"] = cur_tickets
+            else:
+                cookie_str = content
+                sapisid = _extract_sapisid(cookie_str)
+            _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+            return cookie_str, sapisid if sapisid else None
+        except Exception as e:
+            log(f"Cookie load error: {e}")
+            return _cookie_cache["str"], _cookie_cache["sapisid"]
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -672,6 +804,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return False
 
     def do_OPTIONS(self):
+        if self.path.split("?", 1)[0] == "/v1/cookies":
+            origin = self.headers.get("Origin", "")
+            if not origin.startswith("chrome-extension://"):
+                self.send_response(403)
+                self.end_headers()
+                return
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Gemini-Cookie-Sync")
+            self.end_headers()
+            return
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -711,6 +855,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.handle_chat(body)
             elif self.path == "/v1/responses":
                 self.handle_responses(body)
+            elif self.path == "/v1/cookies":
+                self.handle_update_cookies(body)
             elif ":streamGenerateContent" in self.path:
                 self._handle_google_generate(body, stream=True)
             elif ":generateContent" in self.path:
@@ -769,6 +915,36 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if tools and text:
             text, tool_calls = parse_tool_calls(text)
         return text or "", tool_calls
+
+    def _cookie_sync_allowed(self) -> bool:
+        origin = self.headers.get("Origin", "")
+        if origin and not origin.startswith("chrome-extension://"):
+            return False
+        if self.headers.get("X-Gemini-Cookie-Sync") != "1":
+            return False
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+        if host and host not in ("127.0.0.1", "localhost", "::1"):
+            return False
+        if not (CONFIG.get("api_keys") or []):
+            client_ip = self.client_address[0] if self.client_address else ""
+            if client_ip not in _LOOPBACK_ADDRS:
+                return False
+        return True
+
+    def handle_update_cookies(self, body: bytes):
+        if not self._cookie_sync_allowed():
+            self.send_json({"error": {"message": "cookie sync forbidden"}}, 403)
+            return
+        try:
+            req = json.loads(body) if body else None
+        except json.JSONDecodeError:
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        ok, err_msg, status = update_cookie_payload(req)
+        if not ok:
+            self.send_json({"error": {"message": err_msg}}, status)
+            return
+        self.send_json({"status": "ok"})
 
     def handle_chat(self, body: bytes):
         req = json.loads(body)

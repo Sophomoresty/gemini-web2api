@@ -257,10 +257,21 @@ async function readGeminiPageMetadata(tabs) {
   }
 }
 
+async function readStoredModelTickets() {
+  try {
+    const res = await chrome.storage.local.get("model_tickets");
+    const stored = res?.model_tickets;
+    return stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+  } catch {
+    return {};
+  }
+}
+
 async function buildInspection() {
-  const [cookies, tabs] = await Promise.all([
+  const [cookies, tabs, modelTickets] = await Promise.all([
     readGoogleCookies(),
-    chrome.tabs.query({ url: "https://gemini.google.com/*" })
+    chrome.tabs.query({ url: "https://gemini.google.com/*" }),
+    readStoredModelTickets()
   ]);
 
   const selected = selectBestCookies(cookies);
@@ -279,7 +290,8 @@ async function buildInspection() {
     legacyMissing,
     available,
     authUser,
-    pageMetadata
+    pageMetadata,
+    modelTickets
   };
 }
 
@@ -292,8 +304,10 @@ function inspectionMessage(info) {
     legacyMissing,
     available,
     authUser,
-    pageMetadata
+    pageMetadata,
+    modelTickets
   } = info;
+  const ticketKeys = Object.keys(modelTickets || {});
 
   const lines = [
     `Found ${cookies.length} cookie(s) across Google domains.`,
@@ -303,6 +317,7 @@ function inspectionMessage(info) {
     `XSRF / SNlM0e: ${pageMetadata.xsrfToken ? "present" : "missing"}`,
     `gemini_bl / cfb2h: ${pageMetadata.geminiBl ? "present" : "missing"}`,
     `auth_user: ${authUser ?? "default account"}`,
+    `model_tickets: ${ticketKeys.length > 0 ? `${ticketKeys.length} captured (${ticketKeys.join(", ")})` : "none yet (send 1 message in Gemini to capture)"}`,
     `Page data source: ${pageMetadata.source || "unavailable"}`,
     "",
     `Legacy present: ${legacyPresent.join(", ") || "none"}`,
@@ -349,6 +364,15 @@ async function downloadJson(filename, payload) {
   setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 
+async function pushToLocalServer(payload) {
+  try {
+    const res = await chrome.runtime.sendMessage({ type: "sync-cookies", payload });
+    return res || { ok: false, status: 0 };
+  } catch {
+    return { ok: false, status: 0 };
+  }
+}
+
 openButton.addEventListener("click", async () => {
   await chrome.tabs.create({ url: "https://gemini.google.com/app" });
 });
@@ -380,23 +404,33 @@ exportButton.addEventListener("click", async () => {
     }
 
     const cookieString = buildCookieString(info);
+    const ticketKeys = Object.keys(info.modelTickets || {});
     const payload = {
       cookie: cookieString,
       sapisid: info.selected.get("SAPISID").value,
       auth_user: info.authUser,
       xsrf_token: info.pageMetadata.xsrfToken,
-      gemini_bl: info.pageMetadata.geminiBl
+      gemini_bl: info.pageMetadata.geminiBl,
+      ...(ticketKeys.length > 0 ? { model_tickets: info.modelTickets } : {})
     };
 
+    const syncRes = await pushToLocalServer(payload);
     await downloadJson("gemini-auth.json", payload);
 
     const exportedNames = EXPORT_ORDER.filter((name) => info.selected.has(name));
+    const syncLabel = syncRes.ok
+      ? "synced to 127.0.0.1:8081"
+      : syncRes.status
+        ? `rejected (HTTP ${syncRes.status})`
+        : "server offline (saved to file)";
     setStatus(
       `Created gemini-auth.json with ${exportedNames.length} cookie(s) and XSRF.\n\n` +
       `Session cookie: ${info.validation.sessionCookie}\n` +
       `XSRF: present\n` +
       `gemini_bl: ${info.pageMetadata.geminiBl ? "present" : "not present — current server setting will remain"}\n` +
-      `auth_user: ${info.authUser ?? "null"}\n\n` +
+      `auth_user: ${info.authUser ?? "null"}\n` +
+      `model_tickets: ${ticketKeys.length > 0 ? `${ticketKeys.length} exported` : "none captured yet"}\n` +
+      `Local server sync: ${syncLabel}\n\n` +
       "Move the file into gemini-web2api and do not share it or commit it to Git.",
       "ok"
     );

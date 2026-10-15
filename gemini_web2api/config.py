@@ -17,6 +17,7 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "model_tickets": {},
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
