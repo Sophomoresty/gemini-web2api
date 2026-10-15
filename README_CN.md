@@ -78,19 +78,32 @@ gemini
 
 | 模型 | 说明 | 输出量 |
 |------|------|--------|
+| `gemini-4-argon` | Gemini 4 Argon (Ultra 路由, 默认中等思考深度) | ~2万字 |
+| `gemini-4-argon-low` / `-medium` / `-high` | Gemini 4 Argon (指定低 / 中 / 高思考深度) | ~2万字 |
+| `gemini-3.8-flash` | 快速全能模型 (Flash 系列, 按账号灰度返回 3.6/3.8 Flash) | ~1.2万字 |
+| `gemini-3.8-flash-thinking` | Gemini 3.8 Flash 深度思考 | **~2万字** |
+| `gemini-3.8-flash-thinking-lite` | Gemini 3.8 Flash 自适应思考深度 | ~1.5万字 |
+| `gemini-3.7-flash` | 全能模型 (Gemini 3.7 Flash) | ~1.2万字 |
 | `gemini-3.6-flash` | 全能模型 (最新) | ~1.2万字 |
 | `gemini-3.5-flash` | gemini-3.6-flash 别名 | ~1.2万字 |
 | `gemini-3.5-flash-thinking` | 扩展思考, 最长输出 | **~2万字** |
 | `gemini-3.5-flash-thinking-lite` | 自适应思考深度 | ~1.5万字 |
 | `gemini-3.1-pro` | 高级数学与代码 (需 cookie) | ~1.2万字 |
+| `gemini-3.1-pro-low` / `-medium` / `-high` | Gemini 3.1 Pro (指定低 / 中 / 高思考深度) | ~1.2万–2万字 |
 | `gemini-auto` | 自动选择模型 | 不定 |
 | `gemini-flash-lite` | 最快响应, 轻量 | ~1万字 |
 
 ### 思考深度
 
-在模型名后追加 `@think=N`:
+支持以下方式调节思考深度:
+- **`reasoning_effort`** (`/v1/chat/completions`), **`reasoning.effort`** (`/v1/responses`), 或 **`thinkingConfig.thinkingLevel`** (`/v1beta/models`), 可选 `"low"`, `"medium"`, `"high"`
+- **模型后缀** (`gemini-4-argon-low`, `gemini-4-argon-medium`, `gemini-4-argon-high`)
+- **在模型名后追加 `@think=N`**:
 
 ```
+gemini-4-argon@think=0              # 最深 / 高思考深度
+gemini-4-argon@think=2              # 中等思考深度
+gemini-4-argon@think=4              # 最浅 / 低思考深度
 gemini-3.5-flash-thinking@think=0   # 最深 (默认)
 gemini-3.5-flash-thinking@think=2   # 中等
 gemini-3.5-flash-thinking@think=4   # 最浅
@@ -158,6 +171,7 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
+  "ticket_timeout_sec": 25,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
@@ -171,6 +185,11 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 
 将 `temporary_chats` 设置为 `true` 后，请求会使用 Gemini 网页版的临时聊天，
 不会将对话保存在账号历史记录中。
+
+**模型 Ticket 与账号权限回退 (`send_model_ticket` / `model_tickets` / `ticket_timeout_sec`)**:
+- `send_model_ticket` (默认 `true`) 会发送 `X-Goog-Ext-525001261-Jspb` 请求头以路由至 `gemini-4-argon`、`gemini-3.1-pro`、`gemini-3.8-flash` 或 `gemini-flash-lite`。
+- 如果当前账号无目标模型权限，或上游对该 Ticket 返回预设错误 / `BardErrorInfo` / 超过 `ticket_timeout_sec`（默认 `25` 秒）未返回有效文本，服务会自动记录警告并移除该请求头重试一次，回退至账号默认模型返回结果。
+- 如需自定义抓包获取的 16 位十六进制 Ticket（浏览器 DevTools `StreamGenerate` 请求头 `X-Goog-Ext-525001261-Jspb` 数组的第 5 项 `[4]`），可在 `config.json` 中配置 `"model_tickets": {"gemini-4-argon": "<16位hex>"}`（基础模型名配置会自动作用于 `-low`/`-medium`/`-high` 变体）。
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
 

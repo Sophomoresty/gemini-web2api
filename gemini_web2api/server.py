@@ -14,6 +14,22 @@ from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
 
+def _extract_reasoning_effort(req: dict):
+    """Extract reasoning_effort / thinkingLevel from OpenAI or Gemini request payload."""
+    if not isinstance(req, dict):
+        return None
+    effort = req.get("reasoning_effort")
+    if not effort and isinstance(req.get("reasoning"), dict):
+        effort = req["reasoning"].get("effort")
+    if not effort and isinstance(req.get("thinkingConfig"), dict):
+        effort = req["thinkingConfig"].get("thinkingLevel")
+    if not effort and isinstance(req.get("generationConfig"), dict):
+        gen_cfg = req["generationConfig"]
+        if isinstance(gen_cfg.get("thinkingConfig"), dict):
+            effort = gen_cfg["thinkingConfig"].get("thinkingLevel")
+    return effort
+
+
 def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
     c = len(text or "") // 4
@@ -179,7 +195,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
         model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
+            req.get("model", CONFIG["default_model"]),
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -200,6 +218,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         if stream and (not tools or tool_choice == "none"):
+            stream_iter = generate_stream(prompt, model_id, think_mode, file_refs, extra_fields)
             try:
                 self._start_sse()
                 first_chunk = {
@@ -215,7 +234,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in stream_iter:
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -229,6 +248,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+            finally:
+                if hasattr(stream_iter, "close"):
+                    stream_iter.close()
             return
 
         try:
@@ -269,7 +291,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
         model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
+            req.get("model", CONFIG["default_model"]),
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -494,7 +518,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
         m = re.match(r'/v1beta/models/([^:?]+)', self.path)
         model_name = m.group(1) if m else CONFIG["default_model"]
-        model_name, model_id, think_mode, err, extra_fields = resolve_model(model_name)
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(
+            model_name,
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -515,10 +542,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
 
         if stream and not has_tools:
+            stream_iter = generate_stream(prompt, model_id, think_mode, file_refs, extra_fields)
             try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in stream_iter:
                     if not delta:
                         continue
                     full_text += delta
@@ -543,6 +571,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Google stream error: {e}")
+            finally:
+                if hasattr(stream_iter, "close"):
+                    stream_iter.close()
             return
 
         try:

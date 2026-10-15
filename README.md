@@ -88,19 +88,32 @@ Supports Google native API endpoints:
 
 | Model | Description | Output |
 |-------|-------------|--------|
+| `gemini-4-argon` | Gemini 4 Argon (Ultra web routing, medium thinking default) | ~20k chars |
+| `gemini-4-argon-low` / `-medium` / `-high` | Gemini 4 Argon with explicit low / medium / high thinking effort | ~20k chars |
+| `gemini-3.8-flash` | Fast all-around model (Flash family; serves 3.6/3.8 Flash per account) | ~12k chars |
+| `gemini-3.8-flash-thinking` | Gemini 3.8 Flash with deep thinking | **~20k chars** |
+| `gemini-3.8-flash-thinking-lite` | Gemini 3.8 Flash with adaptive thinking depth | ~15k chars |
+| `gemini-3.7-flash` | All-around model (Gemini 3.7 Flash) | ~12k chars |
 | `gemini-3.6-flash` | All-around model (latest) | ~12k chars |
 | `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
 | `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
 | `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
 | `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
+| `gemini-3.1-pro-low` / `-medium` / `-high` | Gemini 3.1 Pro with explicit thinking effort | ~12k–20k chars |
 | `gemini-auto` | Auto model selection | varies |
 | `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
 
 ### Thinking Depth
 
-Append `@think=N` to any model name:
+Control thinking depth via:
+- **`reasoning_effort`** (`"low"`, `"medium"`, `"high"`) in `/v1/chat/completions`, `reasoning.effort` in `/v1/responses`, or `thinkingConfig.thinkingLevel` in `/v1beta/models`
+- **Model suffix** (`gemini-4-argon-low`, `gemini-4-argon-medium`, `gemini-4-argon-high`)
+- **`@think=N` suffix** appended to any model name:
 
 ```
+gemini-4-argon@think=0              # deepest / high thinking
+gemini-4-argon@think=2              # medium thinking
+gemini-4-argon@think=4              # low thinking
 gemini-3.5-flash-thinking@think=0   # deepest (default)
 gemini-3.5-flash-thinking@think=2   # medium
 gemini-3.5-flash-thinking@think=4   # shallowest
@@ -168,6 +181,7 @@ Create `config.json` in the same directory:
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
+  "ticket_timeout_sec": 25,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
@@ -181,6 +195,11 @@ Create `config.json` in the same directory:
 
 Set `temporary_chats` to `true` to use Gemini Web temporary chats instead of
 persisting conversations to the account history.
+
+**Model Tickets & Account Entitlements (`send_model_ticket` / `model_tickets` / `ticket_timeout_sec`)**:
+- `send_model_ticket` (default `true`) sends the `X-Goog-Ext-525001261-Jspb` model ticket header so Gemini Web routes to `gemini-4-argon`, `gemini-3.1-pro`, `gemini-3.8-flash`, or `gemini-flash-lite`.
+- If an account is not entitled to a requested model tier (or a ticket is rejected upstream with a canned error, `BardErrorInfo`, or hangs past `ticket_timeout_sec` [default `25` seconds] before emitting text), `gemini-web2api` automatically logs a warning and retries once without the ticket header so the account's default model answers instead of failing.
+- If Google rotates a model ticket for your account, copy element `[4]` (the 16-char hex ID) from `X-Goog-Ext-525001261-Jspb` in your browser DevTools `StreamGenerate` request and set `"model_tickets": {"gemini-4-argon": "<16-hex-ticket>"}` in `config.json` (base-name overrides also apply to `-low`/`-medium`/`-high` variants).
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
 

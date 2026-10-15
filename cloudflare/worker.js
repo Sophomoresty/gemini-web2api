@@ -170,6 +170,8 @@ var DEFAULT_CONFIG = {
   // 流式请求的 CPU 时间在数据到达时重置，所以不受此严格限制
   // 但初始连接和第一个数据块必须在超时内到达
   requestTimeoutSec: 28,
+  ticketTimeoutSec: 15,
+  sendModelTicket: true,
 
   // ---- Gemini 构建标签 ----
   // Gemini 前端的版本标识，用于 API 请求的 URL 参数
@@ -439,7 +441,52 @@ function getRandomSecChUaPlatform() {
 //   0 = 启用深度思考（模型会花更多时间推理）
 //   4 = AUTO（自动选择思考深度，由 Gemini 决定）
 
+var REASONING_EFFORT_MAP = {
+  minimal: { think: 4, variant: 1 },
+  low: { think: 4, variant: 1 },
+  medium: { think: 2, variant: 4 },
+  high: { think: 0, variant: 2 },
+  xhigh: { think: 0, variant: 2 },
+  max: { think: 0, variant: 2 },
+};
+
+var THINK_TO_VARIANT = { 0: 2, 2: 4, 4: 1 };
+
 var MODELS = {
+  'gemini-4-argon': {
+    mode: 8,
+    think: 2,
+    variant: 4,
+    ticket: '95a4c0abcba24364',
+    levels: true,
+    desc: 'Gemini 4 Argon (Ultra web routing, medium thinking default)',
+  },
+  'gemini-3.8-flash': {
+    mode: 1,
+    think: 4,
+    variant: 1,
+    ticket: '56fdd199312815e2',
+    desc: 'Fast all-around model (Flash family; serves 3.6/3.8 Flash per account)',
+  },
+  'gemini-3.8-flash-thinking': {
+    mode: 2,
+    think: 0,
+    variant: 2,
+    ticket: '56fdd199312815e2',
+    desc: 'Gemini 3.8 Flash with deep thinking (~20k chars)',
+  },
+  'gemini-3.8-flash-thinking-lite': {
+    mode: 5,
+    think: 0,
+    variant: 1,
+    ticket: '56fdd199312815e2',
+    desc: 'Gemini 3.8 Flash with adaptive thinking depth',
+  },
+  'gemini-3.7-flash': {
+    mode: 1,
+    think: 4,
+    desc: 'Latest all-around model (Gemini 3.7 Flash)',
+  },
   'gemini-3.6-flash': {
     mode: 1,        // FAST - 快速模式
     think: 4,       // AUTO - 自动选择思考深度
@@ -458,7 +505,16 @@ var MODELS = {
   'gemini-3.1-pro': {
     mode: 3,        // PRO - 专业版
     think: 4,       // AUTO
+    variant: 1,
+    ticket: 'e6fa609c3fa255c0',
+    levels: true,
     desc: 'Pro model (requires cookie for real routing)',
+  },
+  'gemini-3.1-pro-enhanced': {
+    mode: 3,
+    think: 4,
+    extra: { 31: 2, 80: 3 },
+    desc: 'Pro with enhanced output (experimental)',
   },
   'gemini-auto': {
     mode: 4,        // AUTO - 自动模型选择
@@ -473,9 +529,35 @@ var MODELS = {
   'gemini-flash-lite': {
     mode: 6,        // FLASH_LITE - 轻量快速
     think: 4,       // AUTO
+    variant: 1,
+    ticket: '8c46e95b1a07cecc',
     desc: 'Lightweight fast model',
   },
 };
+
+(function () {
+  var bases = ['gemini-4-argon', 'gemini-3.1-pro'];
+  var levels = [
+    ['low', 4, 1],
+    ['medium', 2, 4],
+    ['high', 0, 2],
+  ];
+  for (var bi = 0; bi < bases.length; bi++) {
+    var base = bases[bi];
+    var baseCfg = MODELS[base];
+    for (var li = 0; li < levels.length; li++) {
+      var lvl = levels[li];
+      MODELS[base + '-' + lvl[0]] = {
+        mode: baseCfg.mode,
+        think: lvl[1],
+        variant: lvl[2],
+        ticket: baseCfg.ticket,
+        levels: false,
+        desc: baseCfg.desc + ' (' + lvl[0] + ' thinking)',
+      };
+    }
+  }
+})();
 
 // ============================================================================
 // 🔑 核心：请求级配置生成器（解决并发串扰 + 多Cookie轮换 + 指纹轮换）
@@ -660,6 +742,13 @@ function getRequestConfig(env) {
   if (env.REQUEST_TIMEOUT_SEC) {
     var rt = parseInt(env.REQUEST_TIMEOUT_SEC, 10);
     if (!isNaN(rt)) config.requestTimeoutSec = rt;
+  }
+  if (env.TICKET_TIMEOUT_SEC) {
+    var tt = parseInt(env.TICKET_TIMEOUT_SEC, 10);
+    if (!isNaN(tt) && tt > 0) config.ticketTimeoutSec = tt;
+  }
+  if (env.SEND_MODEL_TICKET !== undefined) {
+    config.sendModelTicket = String(env.SEND_MODEL_TICKET).toLowerCase() !== 'false';
   }
   // 指纹轮换随机延迟配置
   if (env.FINGERPRINT_JITTER_MS) {
@@ -898,10 +987,21 @@ function getAccountPrefix(config) {
  * @param {Object} config - 请求级配置对象
  * @returns {string} URL 编码的请求体字符串，格式为 "f.req=..."
  */
-function buildPayload(prompt, modelId, thinkMode, config) {
-  // 创建 80 个元素的数组，所有元素初始化为 null
+function buildModelTicket(cfg, variantOverride) {
+  if (!cfg || !cfg.ticket) return null;
+  var variant = variantOverride !== null && variantOverride !== undefined ? variantOverride : (cfg.variant || 1);
+  return JSON.stringify([
+    1, null, null, null, cfg.ticket, null, null, 0,
+    [4, 5, 6, 8, 4, 5, 6, 8],
+    null, null, 2, null, null,
+    cfg.mode, variant, generateUUID(),
+  ]);
+}
+
+function buildPayload(prompt, modelId, thinkMode, config, extraFields) {
+  // 创建 102 个元素的数组，所有元素初始化为 null
   // 这是 Gemini Web 前端实际使用的数据结构
-  var inner = new Array(80).fill(null);
+  var inner = new Array(102).fill(null);
 
   // --- 用户消息 ---
   // [prompt, 消息索引, 图片, 附件, 元数据, 上下文ID, 新对话标志]
@@ -956,8 +1056,15 @@ function buildPayload(prompt, modelId, thinkMode, config) {
   // ⭐ 模型选择（最关键字段）
   // MODE_CATEGORY 枚举值:
   //   1=FAST（快速）, 2=THINKING（深度思考）, 3=PRO（专业版）
-  //   4=AUTO（自动）, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
+  //   4=AUTO（自动）, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE, 8=ULTRA
   inner[79] = modelId;
+  if (extraFields && typeof extraFields === 'object') {
+    var keys = Object.keys(extraFields);
+    for (var ki = 0; ki < keys.length; ki++) {
+      var idx = parseInt(keys[ki], 10);
+      if (!isNaN(idx)) inner[idx] = extraFields[keys[ki]];
+    }
+  }
 
   // --- 外层包装 ---
   // Gemini 的请求体是双层嵌套 JSON:
@@ -1031,7 +1138,7 @@ function buildUrl(config) {
  * @param {Object} config - 请求级配置对象
  * @returns {Promise<Object>} HTTP 请求头对象
  */
-async function buildHeaders(config) {
+async function buildHeaders(config, extraFields) {
   // 获取多账户 URL 前缀
   var prefix = getAccountPrefix(config);
 
@@ -1075,6 +1182,10 @@ async function buildHeaders(config) {
   // 如果使用了非默认账户（authUser 不为空），添加认证用户头
   if (prefix) {
     headers['X-Goog-AuthUser'] = String(config.authUser);
+  }
+
+  if (extraFields && extraFields._ticket && config.sendModelTicket !== false) {
+    headers['X-Goog-Ext-525001261-Jspb'] = extraFields._ticket;
   }
 
   // 第五步：Cookie 认证（如果有）
@@ -1131,7 +1242,7 @@ async function buildHeaders(config) {
  * @returns {Promise<string>} API 原始响应文本（包含嵌套 JSON）
  * @throws {Error} 所有重试失败后抛出最后的错误
  */
-async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
+async function geminiStreamGenerate(prompt, modelId, thinkMode, config, extraFields) {
   // 🎭 请求前添加随机微小延迟（模拟人类操作间隔）
   // 延迟时间在 0 到 fingerprintJitterMs 毫秒之间随机均匀分布
   // 例如 fingerprintJitterMs=1500 时，延迟在 0 到 1.5 秒之间
@@ -1141,8 +1252,8 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
   }
 
   // 构建请求负载、请求头、请求 URL
-  var body = buildPayload(prompt, modelId, thinkMode, config);
-  var headers = await buildHeaders(config);
+  var body = buildPayload(prompt, modelId, thinkMode, config, extraFields);
+  var headers = await buildHeaders(config, extraFields);
   var url = buildUrl(config);
 
   // 保存最后一次错误，所有重试失败后抛出
@@ -1150,11 +1261,22 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
 
   // 重试循环
   for (var attempt = 0; attempt < config.retryAttempts; attempt++) {
+    var hasTicket = Boolean(extraFields && extraFields._ticket && config.sendModelTicket !== false);
+    var activeTimeoutSec = hasTicket
+      ? Math.max(1, Math.min(config.requestTimeoutSec, config.ticketTimeoutSec || 15))
+      : Math.max(1, config.requestTimeoutSec);
+    var controller = new AbortController();
+    var timedOutByTimer = false;
+    var timeout = setTimeout(function () {
+      timedOutByTimer = true;
+      controller.abort();  // 超时后中止请求
+    }, activeTimeoutSec * 1000);
+
     try {
       // 🎭 重试时重新构建请求头（使用不同的浏览器指纹）
       // 这增加了重试成功的机会
       if (attempt > 0) {
-        headers = await buildHeaders(config);
+        headers = await buildHeaders(config, extraFields);
         // 重试时也添加新的随机延迟
         // 避免在完全相同的时间点重试
         if (config.fingerprintJitterMs > 0) {
@@ -1162,12 +1284,6 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
           await new Promise(function (resolve) { setTimeout(resolve, retryJitter); });
         }
       }
-
-      // 创建 AbortController 用于超时控制
-      var controller = new AbortController();
-      var timeout = setTimeout(function () {
-        controller.abort();  // 超时后中止请求
-      }, config.requestTimeoutSec * 1000);
 
       // 发送 HTTP POST 请求
       var response = await fetch(url, {
@@ -1177,8 +1293,10 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
         signal: controller.signal,  // 关联中止信号
       });
 
-      // 请求成功，清除超时定时器
-      clearTimeout(timeout);
+      // 非 Ticket 请求连接建立后即清除连接超时，避免截断超过 28 秒的长响应体
+      if (!hasTicket) {
+        clearTimeout(timeout);
+      }
 
       // ============================================================
       // 错误状态码处理
@@ -1219,9 +1337,28 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
       }
 
       // 请求成功，返回响应文本
-      return await response.text();
+      var rawResp = await response.text();
+      if (hasTicket) {
+        var hasBardErr = /BardErrorInfo\s*\[\d+\]/.test(rawResp);
+        var previewTxt = hasBardErr ? '' : extractResponseText(rawResp);
+        if (hasBardErr || isCannedTicketError(previewTxt)) {
+          log('Model ticket rejected upstream; falling back without X-Goog-Ext-525001261-Jspb header', 'WARN', config);
+          extraFields = stripTicketField(extraFields);
+          headers = await buildHeaders(config, extraFields);
+          attempt--;
+          continue;
+        }
+      }
+      return rawResp;
 
     } catch (error) {
+      if (hasTicket && (timedOutByTimer || (error && error.name === 'AbortError'))) {
+        log('Model ticket timed out upstream; falling back without X-Goog-Ext-525001261-Jspb header', 'WARN', config);
+        extraFields = stripTicketField(extraFields);
+        headers = await buildHeaders(config, extraFields);
+        attempt--;
+        continue;
+      }
       // 保存错误信息
       lastError = error;
 
@@ -1232,6 +1369,8 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
         var delay = config.retryDelaySec * Math.pow(2, attempt) * 1000;
         await new Promise(function (resolve) { setTimeout(resolve, delay); });
       }
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -1242,6 +1381,25 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
 // ============================================================================
 // 📝 文本处理
 // ============================================================================
+
+var CANNED_TICKET_ERROR_RE = /^\W*(?:i'?m having a hard time fulfilling your request|sorry,? something went wrong|something went wrong\.? please try|i seem to be encountering an error|i encountered an error doing what you asked|an error occurred\.? please try|i'?m unable to (?:process|complete) (?:that|this|your) request right now)[^\n]{0,120}$/i;
+
+function isCannedTicketError(text) {
+  if (!text) return false;
+  var s = text.trim().replace(/\u2019/g, "'");
+  if (!s || s.length > 300) return false;
+  return CANNED_TICKET_ERROR_RE.test(s);
+}
+
+function stripTicketField(extraFields) {
+  if (!extraFields || !extraFields._ticket) return extraFields;
+  var stripped = {};
+  var ek = Object.keys(extraFields);
+  for (var ei = 0; ei < ek.length; ei++) {
+    if (ek[ei] !== '_ticket') stripped[ek[ei]] = extraFields[ek[ei]];
+  }
+  return stripped;
+}
 
 /**
  * 清理 Gemini 响应中的代码执行痕迹
@@ -1854,18 +2012,35 @@ function sendSSE(stream) {
  *   - thinkMode: 思考模式（0=深度思考, 4=自动）
  *   - error: 错误信息，null 表示正常
  */
-function resolveModel(modelName) {
+function extractReasoningEffort(body) {
+  if (!body || typeof body !== 'object') return null;
+  if (body.reasoning_effort) return body.reasoning_effort;
+  if (body.reasoning && typeof body.reasoning === 'object' && body.reasoning.effort) {
+    return body.reasoning.effort;
+  }
+  if (body.thinkingConfig && typeof body.thinkingConfig === 'object' && body.thinkingConfig.thinkingLevel) {
+    return body.thinkingConfig.thinkingLevel;
+  }
+  if (body.generationConfig && typeof body.generationConfig === 'object' &&
+      body.generationConfig.thinkingConfig && body.generationConfig.thinkingConfig.thinkingLevel) {
+    return body.generationConfig.thinkingConfig.thinkingLevel;
+  }
+  return null;
+}
+
+function resolveModel(modelName, reasoningEffort) {
   var thinkOverride = null;
+  var variantOverride = null;
   var actualModelName = modelName;
 
   // 检查是否包含 @think= 参数
   if (modelName.indexOf('@think=') !== -1) {
     var parts = modelName.split('@think=');
     actualModelName = parts[0];           // 提取真正的模型名称
-    thinkOverride = parseInt(parts[1], 10);  // 提取思考模式覆盖值
-    if (isNaN(thinkOverride)) {
+    if (!/^-?\d+$/.test(parts[1])) {
       return { error: '无效的 think 参数: ' + parts[1] };
     }
+    thinkOverride = parseInt(parts[1], 10);  // 提取思考模式覆盖值
   }
 
   // 查找模型配置
@@ -1874,11 +2049,36 @@ function resolveModel(modelName) {
     return { error: '未知模型: ' + actualModelName };
   }
 
+  if (thinkOverride !== null) {
+    if ((cfg.levels || cfg.ticket) && THINK_TO_VARIANT[thinkOverride] !== undefined) {
+      variantOverride = THINK_TO_VARIANT[thinkOverride];
+    }
+  } else if (reasoningEffort && cfg.levels) {
+    var effortKey = String(reasoningEffort).trim().toLowerCase();
+    if (REASONING_EFFORT_MAP[effortKey]) {
+      thinkOverride = REASONING_EFFORT_MAP[effortKey].think;
+      variantOverride = REASONING_EFFORT_MAP[effortKey].variant;
+    }
+  }
+
+  var extraFields = {};
+  if (cfg.extra) {
+    var extraKeys = Object.keys(cfg.extra);
+    for (var ei = 0; ei < extraKeys.length; ei++) {
+      extraFields[extraKeys[ei]] = cfg.extra[extraKeys[ei]];
+    }
+  }
+  var ticket = buildModelTicket(cfg, variantOverride);
+  if (ticket) {
+    extraFields._ticket = ticket;
+  }
+
   // 返回解析结果
   return {
     modelName: actualModelName,
     modelId: cfg.mode,                                            // 模型类别 ID
     thinkMode: thinkOverride !== null ? thinkOverride : cfg.think,  // 使用覆盖值或默认值
+    extraFields: extraFields,
     error: null,
   };
 }
@@ -1917,7 +2117,7 @@ function resolveModel(modelName) {
  */
 async function handleChatCompletions(request, body, config) {
   // ---- 第一步：解析模型 ----
-  var resolved = resolveModel(body.model || config.defaultModel);
+  var resolved = resolveModel(body.model || config.defaultModel, extractReasoningEffort(body));
   if (resolved.error) {
     return sendJSON({ error: { message: resolved.error } }, 400);
   }
@@ -1925,6 +2125,7 @@ async function handleChatCompletions(request, body, config) {
   var modelName = resolved.modelName;
   var modelId = resolved.modelId;
   var thinkMode = resolved.thinkMode;
+  var extraFields = resolved.extraFields;
   var tools = body.tools || null;
 
   // ---- 第二步：转换消息为提示文本 ----
@@ -1946,7 +2147,7 @@ async function handleChatCompletions(request, body, config) {
   if (!stream || tools) {
     try {
       // 调用 Gemini API 获取完整响应
-      var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config);
+      var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config, extraFields);
 
       // 提取并清理响应文本
       var text = extractResponseText(raw);
@@ -2100,124 +2301,200 @@ async function handleChatCompletions(request, body, config) {
             }
           }, 2000);
 
-          // ---- 第三步：构建并发送 Gemini 请求 ----
-          var reqBody = buildPayload(prompt, modelId, thinkMode, config);
-          var headers = await buildHeaders(config);
-          var url = buildUrl(config);
+          // ---- 第三步：构建并发送 Gemini 请求（带 Ticket 超时/拒绝回退） ----
+          for (var pass = 0; pass < 2; pass++) {
+            var hasTicket = Boolean(extraFields && extraFields._ticket && config.sendModelTicket !== false);
+            var reqBody = buildPayload(prompt, modelId, thinkMode, config, extraFields);
+            var headers = await buildHeaders(config, extraFields);
+            var url = buildUrl(config);
 
-          // 创建独立的 AbortController 用于超时控制
-          var fetchController = new AbortController();
-          var fetchTimeout = setTimeout(function () {
-            fetchController.abort();  // 超时后中止 fetch 请求
-          }, (config.requestTimeoutSec - 2) * 1000);
+            var fullStreamTimeoutSec = Math.max(1, config.requestTimeoutSec - 2);
+            var initialTimeoutSec = hasTicket
+              ? Math.max(1, Math.min(fullStreamTimeoutSec, config.ticketTimeoutSec || 15))
+              : fullStreamTimeoutSec;
 
-          try {
-            // 发送 HTTP POST 请求到 Gemini
-            var response = await fetch(url, {
-              method: 'POST',
-              headers: headers,
-              body: reqBody,
-              signal: fetchController.signal,
-            });
-            clearTimeout(fetchTimeout);
+            // 创建独立的 AbortController 用于超时控制
+            var fetchController = new AbortController();
+            var timedOutByTimer = false;
+            var fetchTimeout = setTimeout(function () {
+              timedOutByTimer = true;
+              fetchController.abort();  // 超时后中止 fetch 请求
+            }, initialTimeoutSec * 1000);
+            var switchedToFullTimeout = !hasTicket;
+            var reader = null;
+            var prevText = '';
+            var yieldedAny = false;
+            var pending = null;
+            var ticketRejectedReason = null;
 
-            // 检查响应状态码
-            if (!response.ok) {
-              var errorText = '';
-              try {
-                errorText = await response.text();
-              } catch (e) {
-                errorText = '无法读取错误信息';
-              }
-              throw new Error('HTTP ' + response.status + ': ' + errorText.substring(0, 200));
-            }
-
-            // ---- 第四步：读取流式响应并实时转发增量数据 ----
-            var reader = response.body.getReader();
-            var decoder = new TextDecoder();
-            var buffer = '';      // 行缓冲区（处理不完整的行）
-            var prevText = '';    // 记录之前已发送的完整文本
-
-            while (true) {
-              var readResult = await reader.read();
-              if (readResult.done) break;  // 流结束
-
-              // 解码新数据并追加到缓冲区
-              buffer += decoder.decode(readResult.value, { stream: true });
-
-              // 检查 Gemini 错误信息
-              if (buffer.indexOf('BardErrorInfo') !== -1) {
-                var match = buffer.match(/BardErrorInfo\s*\[(\d+)\]/);
-                if (match) {
-                  throw new Error('Gemini upstream rejected request: BardErrorInfo [' + match[1] + ']');
-                }
+            try {
+              // 发送 HTTP POST 请求到 Gemini
+              var response = await fetch(url, {
+                method: 'POST',
+                headers: headers,
+                body: reqBody,
+                signal: fetchController.signal,
+              });
+              if (!hasTicket) {
+                clearTimeout(fetchTimeout);
               }
 
-              // 按行分割处理（Gemini 的响应是每行一个 JSON）
-              var lines = buffer.split('\n');
-              // 最后一行可能不完整，保留在缓冲区中
-              buffer = lines.pop() || '';
-
-              // 遍历每一行完整的数据
-              for (var li = 0; li < lines.length; li++) {
-                var line = lines[li];
-                // 跳过不包含数据标记的行或太短的行
-                if (line.indexOf('"wrb.fr"') === -1 || line.length < 200) continue;
-
+              // 检查响应状态码
+              if (!response.ok) {
+                var errorText = '';
                 try {
-                  // 解析 Gemini 的嵌套 JSON 响应
-                  var arr = JSON.parse(line);
-                  var innerStr = arr[0][2];
-                  if (!innerStr || innerStr.length < 50) continue;
+                  errorText = await response.text();
+                } catch (e) {
+                  errorText = '无法读取错误信息';
+                }
+                throw new Error('HTTP ' + response.status + ': ' + errorText.substring(0, 200));
+              }
 
-                  var inner2 = JSON.parse(innerStr);
+              // ---- 第四步：读取流式响应并实时转发增量数据 ----
+              reader = response.body.getReader();
+              var decoder = new TextDecoder();
+              var buffer = '';      // 行缓冲区（处理不完整的行）
 
-                  // 提取文本内容
-                  if (Array.isArray(inner2) && inner2.length > 4 && inner2[4]) {
-                    var parts = inner2[4];
-                    for (var pi = 0; pi < parts.length; pi++) {
-                      var part = parts[pi];
-                      if (Array.isArray(part) && part.length > 1 && part[1] && Array.isArray(part[1])) {
-                        var textItems = part[1];
-                        for (var ti = 0; ti < textItems.length; ti++) {
-                          var t = textItems[ti];
-                          // 检查是否有新内容（文本长度增加了）
-                          if (typeof t === 'string' && t.length > prevText.length) {
-                            // 🔑 计算增量文本
-                            // 增量 = 当前完整文本 - 之前已发送的完整文本
-                            var delta = t.slice(prevText.length);
-                            // 清理代码执行痕迹（不 trim，保留空白格式）
-                            var cleaned = cleanGeminiText(delta, false);
-                            if (cleaned) {
-                              // 立即将增量块推送给客户端（打字机效果）
-                              controller.enqueue(streamEncoder.encode('data: ' + JSON.stringify({
-                                id: chatId,
-                                object: 'chat.completion.chunk',
-                                created: timestamp(),
-                                model: modelName,
-                                choices: [{
-                                  index: 0,
-                                  delta: { content: cleaned },
-                                  finish_reason: null
-                                }],
-                              }) + '\n\n'));
+              while (true) {
+                var readResult = await reader.read();
+                if (readResult.done) break;  // 流结束
+
+                // 解码新数据并追加到缓冲区
+                buffer += decoder.decode(readResult.value, { stream: true });
+
+                // 检查 Gemini 错误信息
+                if (buffer.indexOf('BardErrorInfo') !== -1) {
+                  var match = buffer.match(/BardErrorInfo\s*\[(\d+)\]/);
+                  if (match) {
+                    if (hasTicket && !yieldedAny) {
+                      ticketRejectedReason = 'BardErrorInfo [' + match[1] + ']';
+                      break;
+                    }
+                    throw new Error('Gemini upstream rejected request: BardErrorInfo [' + match[1] + ']');
+                  }
+                }
+
+                // 按行分割处理（Gemini 的响应是每行一个 JSON）
+                var lines = buffer.split('\n');
+                // 最后一行可能不完整，保留在缓冲区中
+                buffer = lines.pop() || '';
+
+                // 遍历每一行完整的数据
+                for (var li = 0; li < lines.length; li++) {
+                  var line = lines[li];
+                  // 跳过不包含数据标记的行或太短的行
+                  if (line.indexOf('"wrb.fr"') === -1 || line.length < 200) continue;
+
+                  try {
+                    // 解析 Gemini 的嵌套 JSON 响应
+                    var arr = JSON.parse(line);
+                    var innerStr = arr[0][2];
+                    if (!innerStr || innerStr.length < 50) continue;
+
+                    var inner2 = JSON.parse(innerStr);
+
+                    // 提取文本内容
+                    if (Array.isArray(inner2) && inner2.length > 4 && inner2[4]) {
+                      var parts = inner2[4];
+                      for (var pi = 0; pi < parts.length; pi++) {
+                        var part = parts[pi];
+                        if (Array.isArray(part) && part.length > 1 && part[1] && Array.isArray(part[1])) {
+                          var textItems = part[1];
+                          for (var ti = 0; ti < textItems.length; ti++) {
+                            var t = textItems[ti];
+                            // 检查是否有新内容（文本长度增加了）
+                            if (typeof t === 'string' && t.length > prevText.length) {
+                              if (!switchedToFullTimeout) {
+                                clearTimeout(fetchTimeout);
+                                switchedToFullTimeout = true;
+                              }
+                              if (hasTicket && !yieldedAny) {
+                                if (t.length <= 300) {
+                                  pending = t;
+                                  continue;
+                                }
+                                pending = null;
+                              }
+                              // 🔑 计算增量文本
+                              // 增量 = 当前完整文本 - 之前已发送的完整文本
+                              var delta = t.slice(prevText.length);
+                              // 清理代码执行痕迹（不 trim，保留空白格式）
+                              var cleaned = cleanGeminiText(delta, false);
+                              if (cleaned) {
+                                yieldedAny = true;
+                                // 立即将增量块推送给客户端（打字机效果）
+                                controller.enqueue(streamEncoder.encode('data: ' + JSON.stringify({
+                                  id: chatId,
+                                  object: 'chat.completion.chunk',
+                                  created: timestamp(),
+                                  model: modelName,
+                                  choices: [{
+                                    index: 0,
+                                    delta: { content: cleaned },
+                                    finish_reason: null
+                                  }],
+                                }) + '\n\n'));
+                              }
+                              // 更新已发送的文本记录
+                              prevText = t;
                             }
-                            // 更新已发送的文本记录
-                            prevText = t;
                           }
                         }
                       }
                     }
+                  } catch (e) {
+                    // JSON 解析错误，继续处理下一行
+                    // Gemini 的响应可能在传输中被截断
                   }
-                } catch (e) {
-                  // JSON 解析错误，继续处理下一行
-                  // Gemini 的响应可能在传输中被截断
+                }
+              }
+
+              clearTimeout(fetchTimeout);
+              if (!ticketRejectedReason && pending !== null) {
+                if (isCannedTicketError(cleanGeminiText(pending, true))) {
+                  ticketRejectedReason = 'canned error';
+                } else {
+                  var pendingCleaned = cleanGeminiText(pending, false);
+                  if (pendingCleaned) {
+                    yieldedAny = true;
+                    controller.enqueue(streamEncoder.encode('data: ' + JSON.stringify({
+                      id: chatId,
+                      object: 'chat.completion.chunk',
+                      created: timestamp(),
+                      model: modelName,
+                      choices: [{
+                        index: 0,
+                        delta: { content: pendingCleaned },
+                        finish_reason: null
+                      }],
+                    }) + '\n\n'));
+                  }
+                  prevText = pending;
+                }
+              }
+            } catch (passErr) {
+              if (hasTicket && !yieldedAny && (timedOutByTimer || (passErr && passErr.name === 'AbortError'))) {
+                ticketRejectedReason = 'timeout';
+              } else {
+                throw passErr;
+              }
+            } finally {
+              // 无论成功还是失败，确保清除超时定时器
+              clearTimeout(fetchTimeout);
+              if (ticketRejectedReason) {
+                try { fetchController.abort(); } catch (e) {}
+                if (reader) {
+                  try { await reader.cancel(); } catch (e) {}
                 }
               }
             }
-          } finally {
-            // 无论成功还是失败，确保清除超时定时器
-            clearTimeout(fetchTimeout);
+
+            if (ticketRejectedReason && hasTicket) {
+              log('Stream model ticket rejected (' + ticketRejectedReason + '); falling back without X-Goog-Ext-525001261-Jspb header', 'WARN', config);
+              extraFields = stripTicketField(extraFields);
+              continue;
+            }
+            break;
           }
 
           // ---- 第五步：正常结束流 ----
@@ -2280,7 +2557,7 @@ async function handleChatCompletions(request, body, config) {
  */
 async function handleResponses(request, body, config) {
   // 解析模型
-  var resolved = resolveModel(body.model || config.defaultModel);
+  var resolved = resolveModel(body.model || config.defaultModel, extractReasoningEffort(body));
   if (resolved.error) {
     return sendJSON({ error: { message: resolved.error } }, 400);
   }
@@ -2288,6 +2565,7 @@ async function handleResponses(request, body, config) {
   var modelName = resolved.modelName;
   var modelId = resolved.modelId;
   var thinkMode = resolved.thinkMode;
+  var extraFields = resolved.extraFields;
   var messages = [];
 
   // 添加系统指令（instructions 字段）
@@ -2356,7 +2634,7 @@ async function handleResponses(request, body, config) {
 
   try {
     // 调用 Gemini API
-    var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config);
+    var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config, extraFields);
     var text = extractResponseText(raw);
     var toolCalls = null;
 
@@ -2439,13 +2717,14 @@ async function handleGoogleAPI(request, body, stream, config) {
     return sendJSON({ error: { message: 'model not specified in path' } }, 400);
   }
 
-  var resolved = resolveModel(modelName);
+  var resolved = resolveModel(modelName, extractReasoningEffort(body));
   if (resolved.error) {
     return sendJSON({ error: { message: resolved.error } }, 400);
   }
 
   var modelId = resolved.modelId;
   var thinkMode = resolved.thinkMode;
+  var extraFields = resolved.extraFields;
 
   // 转换 Google 格式为提示文本
   var prompt = googleContentsToPrompt(body);
@@ -2454,7 +2733,7 @@ async function handleGoogleAPI(request, body, stream, config) {
   }
 
   try {
-    var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config);
+    var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config, extraFields);
     var text = extractResponseText(raw);
 
     // 构建 Google 格式的响应

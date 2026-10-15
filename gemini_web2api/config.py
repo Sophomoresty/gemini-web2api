@@ -8,6 +8,7 @@ DEFAULT_CONFIG = {
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
+    "ticket_timeout_sec": 25,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
@@ -17,6 +18,8 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "send_model_ticket": True,
+    "model_tickets": {},
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

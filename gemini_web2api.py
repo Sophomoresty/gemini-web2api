@@ -23,24 +23,26 @@ How it works:
 import json
 import urllib.request
 import urllib.parse
-import time
+import urllib.error
 import ssl
-import sys
+import socket
+import time
 import uuid
 import re
 import os
+import sys
 import hashlib
 import argparse
-import base64
-import binascii
-from typing import Optional
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from typing import Optional
 
 try:
     import httpx
     HAS_HTTPX = True
 except ImportError:
+    httpx = None
     HAS_HTTPX = False
 
 __version__ = "1.1.0"
@@ -53,6 +55,7 @@ DEFAULT_CONFIG = {
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
+    "ticket_timeout_sec": 25,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
@@ -62,15 +65,47 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "send_model_ticket": True,
+    "model_tickets": {},
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
 
 # ─── Models ──────────────────────────────────────────────────────────────────
-# Mapping from JS source: MODE_CATEGORY enum (028-6eb337387583.js)
-#   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
+# MODE_CATEGORY enum (_.dF):
+#   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING,
+#   6=FLASH_LITE, 7=FLASH_PLUS, 8=ULTRA (4 Argon)
+# THINKING_LEVEL enum in X-Goog-Ext-525001261-Jspb slot 15 (_.Fod):
+#   1=STANDARD (Low), 4=MEDIUM (Medium), 2=EXTENDED (High), 3=DEEP_THINK
+
+REASONING_EFFORT_MAP = {
+    "minimal": (4, 1),
+    "low": (4, 1),
+    "medium": (2, 4),
+    "high": (0, 2),
+    "xhigh": (0, 2),
+    "max": (0, 2),
+}
+
+THINK_TO_VARIANT = {0: 2, 2: 4, 4: 1}
 
 MODELS = {
+    "gemini-4-argon": {
+        "mode": 8, "think": 2, "variant": 4, "ticket": "95a4c0abcba24364", "levels": True,
+        "desc": "Gemini 4 Argon (Ultra web routing, medium thinking default)",
+    },
+    "gemini-3.8-flash": {
+        "mode": 1, "think": 4, "variant": 1, "ticket": "56fdd199312815e2",
+        "desc": "Fast all-around model (Flash family; serves 3.6/3.8 Flash per account)",
+    },
+    "gemini-3.8-flash-thinking": {
+        "mode": 2, "think": 0, "variant": 2, "ticket": "56fdd199312815e2",
+        "desc": "Gemini 3.8 Flash with deep thinking (~20k chars)",
+    },
+    "gemini-3.8-flash-thinking-lite": {
+        "mode": 5, "think": 0, "variant": 1, "ticket": "56fdd199312815e2",
+        "desc": "Gemini 3.8 Flash with adaptive thinking depth",
+    },
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
         "desc": "Latest all-around model (Gemini 3.7 Flash)",
@@ -88,8 +123,12 @@ MODELS = {
         "desc": "Deep thinking mode, longest output (~20k chars)",
     },
     "gemini-3.1-pro": {
-        "mode": 3, "think": 4,
+        "mode": 3, "think": 4, "variant": 1, "ticket": "e6fa609c3fa255c0", "levels": True,
         "desc": "Pro model (requires cookie for real routing)",
+    },
+    "gemini-3.1-pro-enhanced": {
+        "mode": 3, "think": 4, "extra": {31: 2, 80: 3},
+        "desc": "Pro with enhanced output (experimental)",
     },
     "gemini-auto": {
         "mode": 4, "think": 4,
@@ -100,10 +139,52 @@ MODELS = {
         "desc": "Dynamic thinking with adaptive depth",
     },
     "gemini-flash-lite": {
-        "mode": 6, "think": 4,
+        "mode": 6, "think": 4, "variant": 1, "ticket": "8c46e95b1a07cecc",
         "desc": "Lightweight fast model",
     },
 }
+
+for _base in ("gemini-4-argon", "gemini-3.1-pro"):
+    for _lvl, (_think, _var) in (("low", (4, 1)), ("medium", (2, 4)), ("high", (0, 2))):
+        MODELS[f"{_base}-{_lvl}"] = {
+            **MODELS[_base],
+            "think": _think,
+            "variant": _var,
+            "levels": False,
+            "desc": f"{MODELS[_base]['desc']} ({_lvl} thinking)",
+        }
+
+
+def build_model_ticket(cfg: dict, model_name: str = None, variant_override: int = None, model_tickets: dict = None) -> Optional[str]:
+    """Build the X-Goog-Ext-525001261-Jspb header value for StreamGenerate."""
+    tickets = model_tickets if model_tickets is not None else (CONFIG.get("model_tickets") or {})
+    base_name = re.sub(r"-(low|medium|high)$", "", model_name or "")
+    ticket = tickets.get(model_name) or tickets.get(base_name) or cfg.get("ticket")
+    if not ticket:
+        return None
+    variant = variant_override if variant_override is not None else cfg.get("variant", 1)
+    arr = [
+        1, None, None, None, ticket, None, None, 0,
+        [4, 5, 6, 8, 4, 5, 6, 8],
+        None, None, 2, None, None,
+        cfg["mode"], variant, str(uuid.uuid4()),
+    ]
+    return json.dumps(arr, separators=(",", ":"))
+
+
+def _extract_reasoning_effort(req: dict) -> Optional[str]:
+    if not isinstance(req, dict):
+        return None
+    effort = req.get("reasoning_effort")
+    if not effort and isinstance(req.get("reasoning"), dict):
+        effort = req["reasoning"].get("effort")
+    if not effort and isinstance(req.get("thinkingConfig"), dict):
+        effort = req["thinkingConfig"].get("thinkingLevel")
+    if not effort and isinstance(req.get("generationConfig"), dict):
+        gen_cfg = req["generationConfig"]
+        if isinstance(gen_cfg.get("thinkingConfig"), dict):
+            effort = gen_cfg["thinkingConfig"].get("thinkingLevel")
+    return effort
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
 
@@ -113,28 +194,66 @@ def log(msg: str):
         sys.stderr.flush()
 
 
+_cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
+_refresh_lock = threading.Lock()
+
+
+def _parse_netscape_cookies(raw: str) -> str:
+    pairs = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            domain = parts[0].lstrip(".").lower()
+            if domain == "google.com" or domain.endswith(".google.com"):
+                pairs[parts[5]] = parts[6]
+    return "; ".join(f"{k}={v}" for k, v in pairs.items())
+
+
 def load_cookie() -> tuple:
-    """Load cookie from file. Returns (cookie_str, sapisid)."""
+    """Load cookie from file with mtime-based caching. Returns (cookie_str, sapisid)."""
     cookie_file = CONFIG.get("cookie_file")
-    if not cookie_file:
-        return "", None
-    if not os.path.exists(cookie_file):
+    if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     try:
-        with open(cookie_file, "r") as f:
+        mtime = os.path.getmtime(cookie_file)
+        if mtime == _cookie_cache["mtime"]:
+            return _cookie_cache["str"], _cookie_cache["sapisid"]
+        with open(cookie_file, "r", encoding="utf-8") as f:
             content = f.read().strip()
         if content.startswith("{"):
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+            if data.get("xsrf_token"):
+                CONFIG["xsrf_token"] = data["xsrf_token"]
+            if data.get("gemini_bl"):
+                CONFIG["gemini_bl"] = data["gemini_bl"]
+            if data.get("auth_user") not in (None, "") and CONFIG.get("auth_user") in (None, ""):
+                CONFIG["auth_user"] = str(data["auth_user"])
+            if isinstance(data.get("model_tickets"), dict):
+                tickets = dict(CONFIG.get("model_tickets") or {})
+                tickets.update(data["model_tickets"])
+                CONFIG["model_tickets"] = tickets
+        elif "\t" in content:
+            cookie_str = _parse_netscape_cookies(content)
+            sapisid = ""
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
             sapisid = pairs.get("SAPISID", "")
+        if not sapisid and cookie_str:
+            m = re.search(r"(?:^|;\s*)SAPISID=([^;\s]+)", cookie_str)
+            sapisid = m.group(1) if m else ""
+        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
         log(f"Cookie load error: {e}")
-        return "", None
+        return _cookie_cache["str"], _cookie_cache["sapisid"]
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -161,11 +280,16 @@ def apply_chat_persistence_flags(inner: list) -> None:
 
 
 def fetch_latest_bl() -> Optional[str]:
-    """Fetch the latest gemini_bl from gemini.google.com page."""
+    """Fetch the latest gemini_bl (and xsrf_token) from gemini.google.com page."""
     try:
-        req = urllib.request.Request(
-            "https://gemini.google.com/app",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        cookie_str, sapisid = load_cookie()
+        prefix = account_prefix()
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+        if sapisid:
+            headers["Authorization"] = make_sapisidhash(sapisid)
+        req = urllib.request.Request(f"https://gemini.google.com{prefix}/app", headers=headers)
         ctx = ssl.create_default_context()
         proxy = CONFIG.get("proxy")
         if proxy:
@@ -176,7 +300,12 @@ def fetch_latest_bl() -> Optional[str]:
         else:
             resp = urllib.request.urlopen(req, context=ctx, timeout=15)
         html = resp.read().decode("utf-8", errors="replace")
-        m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
+        at_m = re.search(r'"SNlM0e"\s*:\s*"([^"]+)"', html)
+        if at_m:
+            CONFIG["xsrf_token"] = at_m.group(1)
+        m = re.search(r'"cfb2h"\s*:\s*"([^"]+)"', html) or re.search(
+            r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html
+        )
         if m:
             return m.group(1)
     except Exception as e:
@@ -185,13 +314,16 @@ def fetch_latest_bl() -> Optional[str]:
 
 
 def update_bl_if_needed() -> bool:
-    """Attempt to fetch and update gemini_bl. Returns True if updated."""
-    new_bl = fetch_latest_bl()
-    if new_bl and new_bl != CONFIG["gemini_bl"]:
-        log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
-        CONFIG["gemini_bl"] = new_bl
-        return True
-    return False
+    """Attempt to fetch and update gemini_bl and xsrf_token. Returns True if updated."""
+    old = (CONFIG.get("gemini_bl"), CONFIG.get("xsrf_token"))
+    with _refresh_lock:
+        if (CONFIG.get("gemini_bl"), CONFIG.get("xsrf_token")) != old:
+            return True
+        new_bl = fetch_latest_bl()
+        if new_bl and new_bl != CONFIG["gemini_bl"]:
+            log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
+            CONFIG["gemini_bl"] = new_bl
+        return (CONFIG.get("gemini_bl"), CONFIG.get("xsrf_token")) != old
 
 
 def upload_images(images: list) -> list:
@@ -220,9 +352,10 @@ def upload_images(images: list) -> list:
 
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
-def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
+def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Send prompt to Gemini StreamGenerate with retry."""
-    inner = [None] * 80
+    load_cookie()
+    inner = [None] * 102
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
         inner[0] = [prompt, 0, None, refs, None, None, 0]
@@ -244,37 +377,46 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
+    if extra_fields:
+        for k, v in extra_fields.items():
+            if isinstance(k, int):
+                inner[k] = v
 
     outer = [None, json.dumps(inner)]
-    params = {"f.req": json.dumps(outer)}
-    if CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
-    body = urllib.parse.urlencode(params).encode()
-    reqid = int(time.time()) % 1000000
-    prefix = account_prefix()
-    url = (
-        f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
-        "assistant.lamda.BardFrontendService/StreamGenerate"
-        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
-    )
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://gemini.google.com",
-        "Referer": f"https://gemini.google.com{prefix}/app",
-        "X-Same-Domain": "1",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-    if prefix:
-        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-
-    cookie_str, sapisid = load_cookie()
-    if cookie_str:
-        headers["Cookie"] = cookie_str
-    if sapisid:
-        headers["Authorization"] = make_sapisidhash(sapisid)
-
     last_err = None
-    for attempt in range(CONFIG["retry_attempts"]):
+    refreshed = False
+    attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
+    attempt = 0
+    while attempt < attempts:
+        params = {"f.req": json.dumps(outer)}
+        if CONFIG.get("xsrf_token"):
+            params["at"] = CONFIG["xsrf_token"]
+        body = urllib.parse.urlencode(params).encode()
+        reqid = int(time.time()) % 1000000
+        prefix = account_prefix()
+        url = (
+            f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
+            "assistant.lamda.BardFrontendService/StreamGenerate"
+            f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+        )
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://gemini.google.com",
+            "Referer": f"https://gemini.google.com{prefix}/app",
+            "X-Same-Domain": "1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        if prefix:
+            headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+        has_ticket = bool(extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True))
+        if has_ticket:
+            headers["X-Goog-Ext-525001261-Jspb"] = extra_fields["_ticket"]
+        cookie_str, sapisid = load_cookie()
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+        if sapisid:
+            headers["Authorization"] = make_sapisidhash(sapisid)
+        req_timeout = _ticket_timeout() if has_ticket else CONFIG["request_timeout_sec"]
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             ctx = ssl.create_default_context()
@@ -284,36 +426,44 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
                     urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                     urllib.request.HTTPSHandler(context=ctx)
                 )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+                resp = opener.open(req, timeout=req_timeout)
             else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            return resp.read().decode("utf-8", errors="replace")
+                resp = urllib.request.urlopen(req, context=ctx, timeout=req_timeout)
+            raw = resp.read().decode("utf-8", errors="replace")
+            if has_ticket:
+                bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
+                if bard_err or _is_canned_error(extract_response_text(raw)):
+                    extra_fields = _strip_ticket(extra_fields)
+                    log("Model ticket rejected upstream; falling back without X-Goog-Ext-525001261-Jspb header")
+                    continue
+            return raw
         except urllib.error.HTTPError as e:
-            if e.code == 405 and update_bl_if_needed():
-                reqid = int(time.time()) % 1000000
-                url = (
-                    f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
-                    "assistant.lamda.BardFrontendService/StreamGenerate"
-                    f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
-                )
-                log("Retrying with updated BL...")
-                last_err = e
-                continue
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+            if e.code in (400, 405) and not refreshed and update_bl_if_needed():
+                refreshed = True
+                log("Retrying with updated BL/XSRF...")
+                continue
+            attempt += 1
+            if attempt < attempts:
+                log(f"Retry {attempt}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
+            if has_ticket and _is_timeout_error(e):
+                extra_fields = _strip_ticket(extra_fields)
+                log(f"Model ticket timed out ({e}); falling back without X-Goog-Ext-525001261-Jspb header")
+                continue
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+            attempt += 1
+            if attempt < attempts:
+                log(f"Retry {attempt}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
     raise last_err
 
 
-def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
+def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
     """Send prompt and yield incremental text deltas using httpx streaming."""
-    inner = [None] * 80
+    load_cookie()
+    inner = [None] * 102
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
         inner[0] = [prompt, 0, None, refs, None, None, 0]
@@ -335,6 +485,10 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
+    if extra_fields:
+        for k, v in extra_fields.items():
+            if isinstance(k, int):
+                inner[k] = v
 
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
@@ -357,6 +511,9 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     }
     if prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+    has_ticket = bool(extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True))
+    if has_ticket:
+        headers["X-Goog-Ext-525001261-Jspb"] = extra_fields["_ticket"]
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -367,15 +524,19 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
 
     if not HAS_HTTPX:
         # Fallback: non-streaming with urllib
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
         text = extract_response_text(raw)
         if text:
             yield text
         return
 
     prev_text = ""
+    yielded_any = False
+    pending = None
+    ticket_rejected = None
+    req_timeout = _ticket_timeout() if has_ticket else CONFIG["request_timeout_sec"]
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-    with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
+    with httpx.Client(transport=transport, timeout=req_timeout, verify=True) as client:
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
@@ -383,9 +544,10 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                 for chunk in resp.iter_text():
                     buf += chunk
                     if "BardErrorInfo" in buf:
-                        import re as _re
-                        m = _re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                        m = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
                         if m:
+                            if not yielded_any and has_ticket:
+                                raise _TicketRejectedError(f"BardErrorInfo [{m.group(1)}]")
                             raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{m.group(1)}]")
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
@@ -402,23 +564,50 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                                     if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
                                         for t in part[1]:
                                             if isinstance(t, str) and len(t) > len(prev_text):
+                                                if has_ticket and not yielded_any:
+                                                    if len(t) <= 300:
+                                                        pending = t
+                                                        continue
+                                                    pending = None
                                                 delta = t[len(prev_text):]
                                                 delta = clean_gemini_text(delta, strip=False)
                                                 if delta:
+                                                    yielded_any = True
                                                     yield delta
                                                 prev_text = t
                         except (json.JSONDecodeError, IndexError, TypeError):
                             pass
+                if pending is not None:
+                    if _is_canned_error(clean_gemini_text(pending)):
+                        raise _TicketRejectedError("canned error")
+                    delta = clean_gemini_text(pending, strip=False)
+                    prev_text = pending
+                    if delta:
+                        yielded_any = True
+                        yield delta
+        except _TicketRejectedError as e:
+            ticket_rejected = str(e)
         except Exception as e:
-            if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 405:
+            if yielded_any:
+                raise
+            if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) in (400, 405):
                 if update_bl_if_needed():
-                    log("BL updated, falling back to non-streaming for this request")
-                    raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+                    log("BL/XSRF updated, falling back to non-streaming for this request")
+                    raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
                     text = extract_response_text(raw)
                     if text:
                         yield text
                     return
-            raise
+                raise
+            if has_ticket and _is_timeout_error(e):
+                ticket_rejected = f"timeout: {e}"
+            else:
+                raise
+
+    if ticket_rejected:
+        log(f"Stream model ticket rejected ({ticket_rejected}); falling back without X-Goog-Ext-525001261-Jspb header")
+        for d in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, _strip_ticket(extra_fields)):
+            yield d
 
 
 def clean_gemini_text(text: str, strip: bool = True) -> str:
@@ -428,6 +617,70 @@ def clean_gemini_text(text: str, strip: bool = True) -> str:
         '', text, flags=re.DOTALL
     )
     return text.strip() if strip else text
+
+
+_CANNED_ERROR_RE = re.compile(
+    r"^\W*(?:i'?m having a hard time fulfilling your request"
+    r"|sorry,? something went wrong"
+    r"|something went wrong\.? please try"
+    r"|i seem to be encountering an error"
+    r"|i encountered an error doing what you asked"
+    r"|an error occurred\.? please try"
+    r"|i'?m unable to (?:process|complete) (?:that|this|your) request right now)"
+    r"[^\n]{0,120}$",
+    re.IGNORECASE,
+)
+
+
+class _TicketRejectedError(Exception):
+    pass
+
+
+def _is_canned_error(text: str) -> bool:
+    if not text:
+        return False
+    s = text.strip().replace("\u2019", "'")
+    if not s or len(s) > 300:
+        return False
+    return bool(_CANNED_ERROR_RE.match(s))
+
+
+def _strip_ticket(extra_fields: dict) -> dict:
+    if not extra_fields or not extra_fields.get("_ticket"):
+        return extra_fields
+    return {k: v for k, v in extra_fields.items() if k != "_ticket"}
+
+
+def _ticket_timeout() -> float:
+    try:
+        req_t = float(CONFIG.get("request_timeout_sec") or 180)
+    except (ValueError, TypeError):
+        req_t = 180.0
+    raw_tt = CONFIG.get("ticket_timeout_sec", 25)
+    if raw_tt is None:
+        return max(1.0, min(req_t, 25.0))
+    try:
+        tt = float(raw_tt)
+    except (ValueError, TypeError):
+        tt = 25.0
+    if tt <= 0:
+        return max(1.0, req_t)
+    return max(1.0, min(req_t, tt))
+
+
+def _is_timeout_error(err: BaseException) -> bool:
+    if isinstance(err, urllib.error.HTTPError):
+        return False
+    if HAS_HTTPX and httpx is not None:
+        if isinstance(err, (httpx.HTTPStatusError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+            return False
+    if isinstance(err, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(err, urllib.error.URLError) and isinstance(getattr(err, "reason", None), (TimeoutError, socket.timeout)):
+        return True
+    if HAS_HTTPX and httpx is not None and isinstance(err, httpx.TimeoutException):
+        return True
+    return "timed out" in str(err).lower() or "timeout" in type(err).__name__.lower()
 
 
 def extract_response_text(raw: str) -> str:
@@ -752,18 +1005,36 @@ class GeminiHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length) if length else b""
 
-    def _resolve_model(self, model_name):
+    def _resolve_model(self, model_name, reasoning_effort=None):
+        load_cookie()
         think_override = None
+        variant_override = None
         if "@think=" in model_name:
             model_name, think_str = model_name.rsplit("@think=", 1)
-            think_override = int(think_str)
+            try:
+                think_override = int(think_str)
+            except ValueError:
+                return None, None, None, f"Invalid think level: {think_str}", None
         cfg = MODELS.get(model_name)
         if not cfg:
-            return None, None, None, f"Unknown model: {model_name}"
-        return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
+            return None, None, None, f"Unknown model: {model_name}", None
+        if think_override is not None:
+            if cfg.get("levels") or cfg.get("ticket"):
+                variant_override = THINK_TO_VARIANT.get(think_override)
+        elif reasoning_effort and cfg.get("levels"):
+            effort_key = str(reasoning_effort).strip().lower()
+            if effort_key in REASONING_EFFORT_MAP:
+                think_override, variant_override = REASONING_EFFORT_MAP[effort_key]
+        extra = dict(cfg.get("extra") or {})
+        effective_variant = variant_override if variant_override is not None else cfg.get("variant", 1)
+        if CONFIG.get("send_model_ticket", True):
+            ticket_header = build_model_ticket(cfg, model_name=model_name, variant_override=effective_variant)
+            if ticket_header:
+                extra["_ticket"] = ticket_header
+        return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None, extra
 
-    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None, extra_fields=None):
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
@@ -772,8 +1043,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def handle_chat(self, body: bytes):
         req = json.loads(body)
-        model_name, model_id, think_mode, err = self._resolve_model(
-            req.get("model", CONFIG["default_model"]))
+        model_name, model_id, think_mode, err, extra = self._resolve_model(
+            req.get("model", CONFIG["default_model"]),
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -794,6 +1067,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and not tools:
             # True streaming: forward chunks as they arrive
+            stream_iter = gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, extra)
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -803,7 +1077,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs):
+                for delta_text in stream_iter:
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -818,11 +1092,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+            finally:
+                if hasattr(stream_iter, "close"):
+                    stream_iter.close()
             return
 
         # Non-streaming (or tool calling which needs full response)
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs, extra)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -856,8 +1133,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def handle_responses(self, body: bytes):
         """OpenAI Responses API for Codex CLI compatibility."""
         req = json.loads(body)
-        model_name, model_id, think_mode, err = self._resolve_model(
-            req.get("model", CONFIG["default_model"]))
+        model_name, model_id, think_mode, err, extra = self._resolve_model(
+            req.get("model", CONFIG["default_model"]),
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -911,7 +1190,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         try:
             file_refs = upload_images(images)
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs, extra)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -999,7 +1278,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "model not specified in path"}}, 400)
             return
 
-        model_name, model_id, think_mode, err = self._resolve_model(model_name)
+        model_name, model_id, think_mode, err, extra = self._resolve_model(
+            model_name,
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -1011,7 +1293,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         try:
             file_refs = upload_images(images)
-            text, _ = self._call_gemini(prompt, model_id, think_mode, None, file_refs)
+            text, _ = self._call_gemini(prompt, model_id, think_mode, None, file_refs, extra)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
