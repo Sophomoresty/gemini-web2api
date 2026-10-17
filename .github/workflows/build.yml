@@ -1,0 +1,29 @@
+name: Build
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v10
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Install the built wheel and run the entry point
+        run: |
+          uv venv
+          uv pip install --find-links dist "gemini-web2api[streaming]==$(uv version --short)"
+          .venv/bin/gemini-web2api --version
+          .venv/bin/python -c "import gemini_web2api.gemini as g, sys; sys.exit(0 if g.HAS_HTTPX else 1)"

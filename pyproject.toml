@@ -16,3 +16,7 @@ gemini-web2api = "gemini_web2api.__main__:main"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["gemini_web2api*"]
+
