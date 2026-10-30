@@ -3,10 +3,10 @@ import argparse
 import os
 
 from .config import CONFIG, load_config, find_config
-from .models import MODELS
 from .gemini import HAS_HTTPX
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
+from .models import public_models
 
 
 def main():
@@ -34,7 +34,7 @@ def main():
     print(f"gemini-web2api v{__version__}")
     print(f"  Listening: http://0.0.0.0:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
-    print(f"  Models:    {', '.join(MODELS.keys())}")
+    print(f"  Models:    {', '.join(n for n, _ in public_models())}")
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")

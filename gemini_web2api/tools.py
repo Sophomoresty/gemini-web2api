@@ -145,7 +145,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                         text_parts.append("[Image attached]")
             content = " ".join(text_parts)
 
-        if role == "system":
+        if role == "system" or role == "developer":
             parts.append(f"[System instruction]: {content}")
         elif role == "assistant":
             if msg.get("tool_calls"):

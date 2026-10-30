@@ -7,7 +7,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 from .config import CONFIG
-from .models import MODELS, resolve_model
+from .models import resolve_model, public_models
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
@@ -131,16 +131,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
-                    for n, c in MODELS.items()
+                    for n, c in public_models()
                 ]})
             elif self.path.startswith("/v1beta/models"):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
-                    for n, c in MODELS.items()
+                    for n, c in public_models()
                 ]})
             elif self.path == "/":
-                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+                self.send_json({
+                    "status": "ok",
+                    "version": __version__,
+                    "models": [n for n, _ in public_models()],
+                })
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -188,6 +192,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tool_choice = req.get("tool_choice", "auto")
         prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
         if not prompt.strip():
+            msg_count = len(req.get("messages") or [])
+            log(f"Empty prompt rejected (messages={msg_count}, tools={bool(tools)})")
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
 

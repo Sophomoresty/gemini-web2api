@@ -4,6 +4,14 @@
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+    "gemini-3.8-flash": {
+        "mode": 1, "think": 4,
+        "desc": "Latest all-around model (Gemini 3.8 Flash)",
+    },
+    "gemini-3.8": {
+        "mode": 1, "think": 4,
+        "desc": "Latest all-around model (Gemini 3.8)",
+    },
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
         "desc": "Latest all-around model (Gemini 3.7 Flash)",
@@ -42,27 +50,72 @@ MODELS = {
     },
 }
 
+# Client-facing aliases (OpenCode / OpenAI-compatible clients) → canonical MODELS keys.
+# Do not remove or replace entries in MODELS; aliases only remap request names.
+MODEL_ALIASES = {
+    "gemini-pro": "gemini-3.1-pro",
+    "gemini-local-pro": "gemini-3.1-pro",
+    "gemini-local-flash": "gemini-3.7-flash",
+    "gemini-local-38": "gemini-3.8-flash",
+    "gemini-3.8": "gemini-3.8-flash",
+    "gemini-local-thinking": "gemini-3.5-flash-thinking",
+}
 
-def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
+
+def _normalize_requested_model(model_name: str) -> str:
+    """Strip provider prefixes (e.g. openai/gemini-pro → gemini-pro)."""
+    name = (model_name or "").strip()
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name
+
+
+def public_models():
+    """Yield (id, cfg) for /v1/models, including aliases not already in MODELS."""
+    for name, cfg in MODELS.items():
+        yield name, cfg
+    for alias, target in MODEL_ALIASES.items():
+        if alias in MODELS:
+            continue
+        target_cfg = MODELS.get(target)
+        if not target_cfg:
+            continue
+        yield alias, {
+            **target_cfg,
+            "desc": f"Alias for {target} ({target_cfg.get('desc', '')})".strip(),
+        }
+
+
+def resolve_model(model_name: str, default: str = "gemini-3.8-flash"):
     """Resolve model name to (name, mode_id, think_mode, error, extra_fields).
 
     Unknown model names fall back to default rather than erroring,
     since upstream clients may request arbitrary model identifiers.
     """
+    from .gemini import log
+
+    requested = model_name if model_name is not None else default
+    name = _normalize_requested_model(requested)
+
     think_override = None
-    if "@think=" in model_name:
-        model_name, think_str = model_name.rsplit("@think=", 1)
+    if "@think=" in name:
+        name, think_str = name.rsplit("@think=", 1)
         try:
             think_override = int(think_str)
         except ValueError:
             return None, None, None, f"Invalid think level: {think_str}", None
-    cfg = MODELS.get(model_name)
+
+    resolved = MODEL_ALIASES.get(name, name)
+    log(f"[Model Router] Requested: {requested}")
+    log(f"[Model Router] Resolved: {resolved}")
+
+    cfg = MODELS.get(resolved)
     if not cfg:
-        from .gemini import log
-        log(f"Unknown model '{model_name}', falling back to '{default}'")
-        model_name = default
+        log(f"Unknown model '{resolved}', falling back to '{default}'")
+        resolved = default
         cfg = MODELS[default]
+        log(f"[Model Router] Resolved: {resolved}")
     mode_id = cfg["mode"]
     think_mode = think_override if think_override is not None else cfg["think"]
     extra = cfg.get("extra")
-    return model_name, mode_id, think_mode, None, extra
+    return resolved, mode_id, think_mode, None, extra
