@@ -49,6 +49,11 @@ def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
+        for candidate in ["cookies.txt", "cookie.txt", "cookie.json", "cookies.json"]:
+            if os.path.exists(candidate):
+                cookie_file = candidate
+                break
+    if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     try:
         mtime = os.path.getmtime(cookie_file)
@@ -61,7 +66,8 @@ def load_cookie() -> tuple:
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
         else:
-            cookie_str = content
+            parts = [line.strip().rstrip(";") for line in content.splitlines() if line.strip()]
+            cookie_str = "; ".join(parts)
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
             sapisid = pairs.get("SAPISID", "")
         _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})

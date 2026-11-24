@@ -124,44 +124,48 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            path = self.path.split("?", 1)[0].rstrip("/")
+            if not path:
+                path = "/"
+            if (path.startswith("/v1") or path.startswith("/v1beta")) and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            if path in ("/v1/models", "/models"):
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif path.startswith("/v1beta/models"):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path == "/":
+            elif path in ("/", "/v1", "/health", "/v1/health"):
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
             else:
-                self.send_json({"error": "not found"}, 404)
+                self.send_json({"error": "not found", "path": self.path}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
     def do_POST(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            path = self.path.split("?", 1)[0].rstrip("/")
+            if (path.startswith("/v1") or path.startswith("/v1beta")) and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             body = self._read_request_body()
-            if self.path == "/v1/chat/completions":
+            if path in ("/v1/chat/completions", "/chat/completions"):
                 self._handle_chat(body)
-            elif self.path == "/v1/responses":
+            elif path in ("/v1/responses", "/responses"):
                 self._handle_responses(body)
-            elif ":streamGenerateContent" in self.path:
+            elif ":streamGenerateContent" in path:
                 self._handle_google_generate(body, stream=True)
-            elif ":generateContent" in self.path:
+            elif ":generateContent" in path:
                 self._handle_google_generate(body, stream=False)
             else:
-                self.send_json({"error": "not found"}, 404)
+                self.send_json({"error": "not found", "path": self.path}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:

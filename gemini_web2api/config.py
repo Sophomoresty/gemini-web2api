@@ -11,7 +11,7 @@ DEFAULT_CONFIG = {
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.6-flash",
+    "default_model": "gemini-4-hydrogen",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,

@@ -7,7 +7,7 @@
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
-  "default_model": "gemini-3.6-flash",
+  "default_model": "gemini-4-hydrogen",
   "api_keys": [
     "sk-gemini"
   ],

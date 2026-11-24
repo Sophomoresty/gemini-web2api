@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.6-flash",
+    "default_model": "gemini-4-hydrogen",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
@@ -71,21 +71,56 @@ CONFIG = dict(DEFAULT_CONFIG)
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+    # Gemini 4 line-up
+    "gemini-4-hydrogen": {
+        "mode": 1, "think": 4,
+        "desc": "Gemini 4 Hydrogen - High-efficiency workhorse model for speed and everyday coding",
+    },
+    "gemini-4-hydrogen-thinking": {
+        "mode": 2, "think": 0,
+        "desc": "Gemini 4 Hydrogen with deep thinking enabled",
+    },
+    "gemini-4-neon": {
+        "mode": 2, "think": 0,
+        "desc": "Gemini 4 Neon - Mid-tier model for complex reasoning, analytical tasks and coding",
+    },
+    "gemini-4-neon-thinking": {
+        "mode": 2, "think": 0,
+        "desc": "Gemini 4 Neon with extended thinking (~20k+ chars)",
+    },
+    "gemini-4-carbon": {
+        "mode": 3, "think": 4,
+        "desc": "Gemini 4 Carbon - Frontier reasoning model (requires cookie for real routing)",
+    },
+    "gemini-auto": {
+        "mode": 4, "think": 4,
+        "desc": "Auto model selection (Gemini 4)",
+    },
+    # Short aliases
+    "gemini-hydrogen": {
+        "mode": 1, "think": 4,
+        "desc": "Alias for gemini-4-hydrogen",
+    },
+    "gemini-neon": {
+        "mode": 2, "think": 0,
+        "desc": "Alias for gemini-4-neon",
+    },
+    # Legacy / backward-compatible aliases
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
-        "desc": "Latest all-around model (Gemini 3.7 Flash)",
+        "desc": "Legacy alias for gemini-4-hydrogen",
     },
     "gemini-3.6-flash": {
         "mode": 1, "think": 4,
-        "desc": "All-around model (Gemini 3.6 Flash)",
+        "desc": "Legacy alias for gemini-4-hydrogen",
     },
     "gemini-3.5-flash": {
         "mode": 1, "think": 4,
-        "desc": "Alias for gemini-3.6-flash (backend upgraded)",
+        "desc": "Legacy alias for gemini-4-hydrogen",
     },
     "gemini-3.5-flash-thinking": {
         "mode": 2, "think": 0,
-        "desc": "Deep thinking mode, longest output (~20k chars)",
+        "desc": "Legacy alias for gemini-4-neon",
     },
     "gemini-3.1-pro": {
         "mode": 3, "think": 4,
@@ -116,9 +151,12 @@ def log(msg: str):
 def load_cookie() -> tuple:
     """Load cookie from file. Returns (cookie_str, sapisid)."""
     cookie_file = CONFIG.get("cookie_file")
-    if not cookie_file:
-        return "", None
-    if not os.path.exists(cookie_file):
+    if not cookie_file or not os.path.exists(cookie_file):
+        for candidate in ["cookies.txt", "cookie.txt", "cookie.json", "cookies.json"]:
+            if os.path.exists(candidate):
+                cookie_file = candidate
+                break
+    if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     try:
         with open(cookie_file, "r") as f:
@@ -128,7 +166,8 @@ def load_cookie() -> tuple:
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
         else:
-            cookie_str = content
+            parts = [line.strip().rstrip(";") for line in content.splitlines() if line.strip()]
+            cookie_str = "; ".join(parts)
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
             sapisid = pairs.get("SAPISID", "")
         return cookie_str, sapisid if sapisid else None
@@ -680,22 +719,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            path = self.path.split("?", 1)[0].rstrip("/")
+            if not path:
+                path = "/"
+            if (path.startswith("/v1") or path.startswith("/v1beta")) and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            if path in ("/v1/models", "/models"):
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif path.startswith("/v1beta/models"):
                 self._handle_google_models_list()
-            elif self.path == "/":
+            elif path in ("/", "/v1", "/health", "/v1/health"):
                 self.send_json({"status": "ok", "version": __version__,
                                 "models": list(MODELS.keys())})
             else:
-                self.send_json({"error": "not found"}, 404)
+                self.send_json({"error": "not found", "path": self.path}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
@@ -703,20 +745,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            path = self.path.split("?", 1)[0].rstrip("/")
+            if (path.startswith("/v1") or path.startswith("/v1beta")) and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             body = self._read_request_body()
-            if self.path == "/v1/chat/completions":
+            if path in ("/v1/chat/completions", "/chat/completions"):
                 self.handle_chat(body)
-            elif self.path == "/v1/responses":
+            elif path in ("/v1/responses", "/responses"):
                 self.handle_responses(body)
-            elif ":streamGenerateContent" in self.path:
+            elif ":streamGenerateContent" in path:
                 self._handle_google_generate(body, stream=True)
-            elif ":generateContent" in self.path:
+            elif ":generateContent" in path:
                 self._handle_google_generate(body, stream=False)
             else:
-                self.send_json({"error": "not found"}, 404)
+                self.send_json({"error": "not found", "path": self.path}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
@@ -756,10 +799,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
         think_override = None
         if "@think=" in model_name:
             model_name, think_str = model_name.rsplit("@think=", 1)
-            think_override = int(think_str)
+            try:
+                think_override = int(think_str)
+            except ValueError:
+                return None, None, None, f"Invalid think level: {think_str}"
         cfg = MODELS.get(model_name)
         if not cfg:
-            return None, None, None, f"Unknown model: {model_name}"
+            default = CONFIG.get("default_model", "gemini-4-hydrogen")
+            log(f"Unknown model '{model_name}', falling back to '{default}'")
+            model_name = default
+            cfg = MODELS.get(default, list(MODELS.values())[0])
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
     def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):
