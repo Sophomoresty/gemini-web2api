@@ -49,6 +49,11 @@ def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
+        for candidate in ["cookies.txt", "cookie.txt", "cookie.json", "cookies.json"]:
+            if os.path.exists(candidate):
+                cookie_file = candidate
+                break
+    if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     try:
         mtime = os.path.getmtime(cookie_file)

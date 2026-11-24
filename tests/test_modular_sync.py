@@ -8,6 +8,7 @@ from urllib.parse import parse_qs
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.gemini import _build_payload
+from gemini_web2api.models import MODELS, resolve_model
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
 
@@ -439,6 +440,44 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[3][1]["delta"], '{"city":"Shanghai"}')
         self.assertEqual(events[4][1]["arguments"], '{"city":"Shanghai"}')
         self.assertEqual(events[-1][1]["response"]["output"][0]["name"], "get_weather")
+
+
+class ModelResolutionTests(unittest.TestCase):
+    def test_default_model_is_gemini_4_hydrogen(self):
+        self.assertEqual(DEFAULT_CONFIG["default_model"], "gemini-4-hydrogen")
+
+    def test_resolve_gemini_4_hydrogen(self):
+        name, mode_id, think_mode, err, _ = resolve_model("gemini-4-hydrogen")
+        self.assertIsNone(err)
+        self.assertEqual(name, "gemini-4-hydrogen")
+        self.assertEqual(mode_id, 1)
+        self.assertEqual(think_mode, 4)
+
+    def test_resolve_gemini_4_neon(self):
+        name, mode_id, think_mode, err, _ = resolve_model("gemini-4-neon")
+        self.assertIsNone(err)
+        self.assertEqual(name, "gemini-4-neon")
+        self.assertEqual(mode_id, 2)
+        self.assertEqual(think_mode, 0)
+
+    def test_resolve_gemini_4_neon_think_depth_override(self):
+        name, mode_id, think_mode, err, _ = resolve_model("gemini-4-neon@think=2")
+        self.assertIsNone(err)
+        self.assertEqual(name, "gemini-4-neon")
+        self.assertEqual(mode_id, 2)
+        self.assertEqual(think_mode, 2)
+
+    def test_resolve_unknown_model_fallback(self):
+        name, mode_id, think_mode, err, _ = resolve_model("unknown-custom-model")
+        self.assertIsNone(err)
+        self.assertEqual(name, "gemini-4-hydrogen")
+        self.assertEqual(mode_id, 1)
+
+    def test_resolve_legacy_models(self):
+        name, mode_id, think_mode, err, _ = resolve_model("gemini-3.6-flash")
+        self.assertIsNone(err)
+        self.assertEqual(name, "gemini-3.6-flash")
+        self.assertEqual(mode_id, 1)
 
 
 if __name__ == "__main__":

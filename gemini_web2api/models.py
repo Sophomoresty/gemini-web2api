@@ -4,21 +4,56 @@
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+    # Gemini 4 line-up
+    "gemini-4-hydrogen": {
+        "mode": 1, "think": 4,
+        "desc": "Gemini 4 Hydrogen - High-efficiency workhorse model for speed and everyday coding",
+    },
+    "gemini-4-hydrogen-thinking": {
+        "mode": 2, "think": 0,
+        "desc": "Gemini 4 Hydrogen with deep thinking enabled",
+    },
+    "gemini-4-neon": {
+        "mode": 2, "think": 0,
+        "desc": "Gemini 4 Neon - Mid-tier model for complex reasoning, analytical tasks and coding",
+    },
+    "gemini-4-neon-thinking": {
+        "mode": 2, "think": 0,
+        "desc": "Gemini 4 Neon with extended thinking (~20k+ chars)",
+    },
+    "gemini-4-carbon": {
+        "mode": 3, "think": 4,
+        "desc": "Gemini 4 Carbon - Frontier reasoning model (requires cookie for real routing)",
+    },
+    "gemini-auto": {
+        "mode": 4, "think": 4,
+        "desc": "Auto model selection (Gemini 4)",
+    },
+    # Short aliases
+    "gemini-hydrogen": {
+        "mode": 1, "think": 4,
+        "desc": "Alias for gemini-4-hydrogen",
+    },
+    "gemini-neon": {
+        "mode": 2, "think": 0,
+        "desc": "Alias for gemini-4-neon",
+    },
+    # Legacy / backward-compatible aliases
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
-        "desc": "Latest all-around model (Gemini 3.7 Flash)",
+        "desc": "Legacy alias for gemini-4-hydrogen",
     },
     "gemini-3.6-flash": {
         "mode": 1, "think": 4,
-        "desc": "All-around model (Gemini 3.6 Flash)",
+        "desc": "Legacy alias for gemini-4-hydrogen",
     },
     "gemini-3.5-flash": {
         "mode": 1, "think": 4,
-        "desc": "Alias for gemini-3.6-flash (backend upgraded)",
+        "desc": "Legacy alias for gemini-4-hydrogen",
     },
     "gemini-3.5-flash-thinking": {
         "mode": 2, "think": 0,
-        "desc": "Deep thinking mode, longest output (~20k chars)",
+        "desc": "Legacy alias for gemini-4-neon",
     },
     "gemini-3.1-pro": {
         "mode": 3, "think": 4,
@@ -27,10 +62,6 @@ MODELS = {
     "gemini-3.1-pro-enhanced": {
         "mode": 3, "think": 4, "extra": {31: 2, 80: 3},
         "desc": "Pro with enhanced output (experimental)",
-    },
-    "gemini-auto": {
-        "mode": 4, "think": 4,
-        "desc": "Auto model selection",
     },
     "gemini-3.5-flash-thinking-lite": {
         "mode": 5, "think": 0,
@@ -43,7 +74,7 @@ MODELS = {
 }
 
 
-def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
+def resolve_model(model_name: str, default: str = "gemini-4-hydrogen"):
     """Resolve model name to (name, mode_id, think_mode, error, extra_fields).
 
     Unknown model names fall back to default rather than erroring,

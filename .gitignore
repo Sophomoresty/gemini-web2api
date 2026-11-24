@@ -2,8 +2,16 @@ __pycache__/
 *.pyc
 config.json
 cookie.txt
+cookies.txt
 cookie.json
+cookies.json
 .env
 .idea
 .DS_Store
 gemini-auth.json
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+

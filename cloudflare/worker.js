@@ -198,7 +198,7 @@ var DEFAULT_CONFIG = {
   // ---- 默认模型 ----
   // 当客户端请求未指定 model 参数时使用的默认模型
   // 可选值参考 MODELS 字典的键名
-  defaultModel: 'gemini-3.6-flash',
+  defaultModel: 'gemini-4-hydrogen',
 
   // ---- API 密钥白名单 ----
   // 用于验证客户端请求的密钥列表
@@ -440,30 +440,73 @@ function getRandomSecChUaPlatform() {
 //   4 = AUTO（自动选择思考深度，由 Gemini 决定）
 
 var MODELS = {
-  'gemini-3.6-flash': {
+  // Gemini 4 line-up
+  'gemini-4-hydrogen': {
     mode: 1,        // FAST - 快速模式
     think: 4,       // AUTO - 自动选择思考深度
-    desc: 'Latest all-around model (Gemini 3.6 Flash)',
+    desc: 'Gemini 4 Hydrogen - High-efficiency workhorse model for speed and everyday coding',
+  },
+  'gemini-4-hydrogen-thinking': {
+    mode: 2,        // THINKING
+    think: 0,       // 启用深度思考
+    desc: 'Gemini 4 Hydrogen with deep thinking enabled',
+  },
+  'gemini-4-neon': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Gemini 4 Neon - Mid-tier model for complex reasoning, analytical tasks and coding',
+  },
+  'gemini-4-neon-thinking': {
+    mode: 2,        // THINKING
+    think: 0,       // 启用深度思考
+    desc: 'Gemini 4 Neon with extended thinking (~20k+ chars)',
+  },
+  'gemini-4-carbon': {
+    mode: 3,        // PRO - 专业版
+    think: 4,       // AUTO
+    desc: 'Gemini 4 Carbon - Frontier reasoning model (requires cookie for real routing)',
+  },
+  'gemini-auto': {
+    mode: 4,        // AUTO - 自动模型选择
+    think: 4,       // AUTO
+    desc: 'Auto model selection (Gemini 4)',
+  },
+  // Short aliases
+  'gemini-hydrogen': {
+    mode: 1,
+    think: 4,
+    desc: 'Alias for gemini-4-hydrogen',
+  },
+  'gemini-neon': {
+    mode: 2,
+    think: 0,
+    desc: 'Alias for gemini-4-neon',
+  },
+  // Legacy aliases
+  'gemini-3.7-flash': {
+    mode: 1,        // FAST
+    think: 4,       // AUTO
+    desc: 'Legacy alias for gemini-4-hydrogen',
+  },
+  'gemini-3.6-flash': {
+    mode: 1,        // FAST
+    think: 4,       // AUTO
+    desc: 'Legacy alias for gemini-4-hydrogen',
   },
   'gemini-3.5-flash': {
     mode: 1,        // FAST
     think: 4,       // AUTO
-    desc: 'Alias for gemini-3.6-flash (backend upgraded)',
+    desc: 'Legacy alias for gemini-4-hydrogen',
   },
   'gemini-3.5-flash-thinking': {
-    mode: 2,        // THINKING - 深度思考模式
+    mode: 2,        // THINKING
     think: 0,       // 启用深度思考
-    desc: 'Deep thinking mode, longest output (~20k chars)',
+    desc: 'Legacy alias for gemini-4-neon',
   },
   'gemini-3.1-pro': {
     mode: 3,        // PRO - 专业版
     think: 4,       // AUTO
     desc: 'Pro model (requires cookie for real routing)',
-  },
-  'gemini-auto': {
-    mode: 4,        // AUTO - 自动模型选择
-    think: 4,       // AUTO
-    desc: 'Auto model selection',
   },
   'gemini-3.5-flash-thinking-lite': {
     mode: 5,        // FAST_DYNAMIC_THINKING - 动态思考

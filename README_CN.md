@@ -13,7 +13,7 @@
 - **可选密钥**: `api_keys` 为空时免密, 填入密钥后按 OpenAI Bearer Key 校验
 - **OpenAI 兼容**: 直接替换 `/v1/chat/completions` 和 `/v1/models`
 - **工具调用**: 完整的 Function Calling 支持 (OpenAI 格式)
-- **多模型**: Flash (3.6), 扩展思考 (2万字+输出), Pro, Auto, Lite
+- **多模型**: Gemini 4 Hydrogen (高效/日常编程), Gemini 4 Neon (复杂推理/深度思考), Carbon, Auto 以及旧版 Flash 兼容别名
 - **思考深度**: 通过 `@think=N` 后缀调节 (0=最深, 4=最浅)
 - **联网搜索**: 内置互联网访问 (Gemini 原生搜索能力)
 - **跨平台**: 纯 Python, 仅一个可选依赖 (`httpx` 用于流式输出)
@@ -38,7 +38,7 @@ python gemini_web2api.py
 |------|-----|
 | Base URL | `http://localhost:8081/v1` |
 | API Key | `config.json` 中的任意 `api_keys`；未配置时随便填 |
-| Model | `gemini-3.5-flash-thinking` |
+| Model | `gemini-4-hydrogen` 或 `gemini-4-neon` |
 
 ### curl
 
@@ -46,7 +46,7 @@ python gemini_web2api.py
 curl http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-key" \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"你好!"}]}'
+  -d '{"model":"gemini-4-hydrogen","messages":[{"role":"user","content":"你好!"}]}'
 ```
 
 ### OpenAI Python SDK
@@ -55,7 +55,7 @@ curl http://localhost:8081/v1/chat/completions \
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8081/v1", api_key="sk-your-key")
 resp = client.chat.completions.create(
-    model="gemini-3.5-flash-thinking",
+    model="gemini-4-neon",
     messages=[{"role": "user", "content": "解释量子计算"}]
 )
 print(resp.choices[0].message.content)
@@ -78,12 +78,19 @@ gemini
 
 | 模型 | 说明 | 输出量 |
 |------|------|--------|
-| `gemini-3.6-flash` | 全能模型 (最新) | ~1.2万字 |
-| `gemini-3.5-flash` | gemini-3.6-flash 别名 | ~1.2万字 |
-| `gemini-3.5-flash-thinking` | 扩展思考, 最长输出 | **~2万字** |
-| `gemini-3.5-flash-thinking-lite` | 自适应思考深度 | ~1.5万字 |
+| `gemini-4-hydrogen` | 高效主力模型，适合日常编码与代理任务 (默认) | ~1.2万字 |
+| `gemini-4-hydrogen-thinking` | 启用深度思考的 Gemini 4 Hydrogen | ~1.5万字 |
+| `gemini-4-neon` | 中阶模型，擅长复杂推理、算法与多轮代码工程 | ~2万字 |
+| `gemini-4-neon-thinking` | 扩展深度思考模式 | **~2万字+** |
+| `gemini-4-carbon` | 前沿推理模型 (需 Gemini Advanced Cookie 真实路由) | ~1.2万字 |
+| `gemini-auto` | 自动选择模型 (Gemini 4) | 不定 |
+| `gemini-hydrogen` | gemini-4-hydrogen 别名 | ~1.2万字 |
+| `gemini-neon` | gemini-4-neon 别名 | ~2万字 |
+| `gemini-3.7-flash` | 旧版别名，映射到 gemini-4-hydrogen | ~1.2万字 |
+| `gemini-3.6-flash` | 旧版别名，映射到 gemini-4-hydrogen | ~1.2万字 |
+| `gemini-3.5-flash` | 旧版别名，映射到 gemini-4-hydrogen | ~1.2万字 |
+| `gemini-3.5-flash-thinking` | 旧版别名，映射到 gemini-4-neon | **~2万字** |
 | `gemini-3.1-pro` | 高级数学与代码 (需 cookie) | ~1.2万字 |
-| `gemini-auto` | 自动选择模型 | 不定 |
 | `gemini-flash-lite` | 最快响应, 轻量 | ~1万字 |
 
 ### 思考深度
@@ -91,9 +98,9 @@ gemini
 在模型名后追加 `@think=N`:
 
 ```
-gemini-3.5-flash-thinking@think=0   # 最深 (默认)
-gemini-3.5-flash-thinking@think=2   # 中等
-gemini-3.5-flash-thinking@think=4   # 最浅
+gemini-4-neon@think=0   # 最深 (思考默认)
+gemini-4-neon@think=2   # 中等
+gemini-4-neon@think=4   # 最浅
 ```
 
 ## 可选: Cookie 配置 (Pro 模型)

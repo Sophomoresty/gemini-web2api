@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.6-flash",
+    "default_model": "gemini-4-hydrogen",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
@@ -71,21 +71,56 @@ CONFIG = dict(DEFAULT_CONFIG)
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+    # Gemini 4 line-up
+    "gemini-4-hydrogen": {
+        "mode": 1, "think": 4,
+        "desc": "Gemini 4 Hydrogen - High-efficiency workhorse model for speed and everyday coding",
+    },
+    "gemini-4-hydrogen-thinking": {
+        "mode": 2, "think": 0,
+        "desc": "Gemini 4 Hydrogen with deep thinking enabled",
+    },
+    "gemini-4-neon": {
+        "mode": 2, "think": 0,
+        "desc": "Gemini 4 Neon - Mid-tier model for complex reasoning, analytical tasks and coding",
+    },
+    "gemini-4-neon-thinking": {
+        "mode": 2, "think": 0,
+        "desc": "Gemini 4 Neon with extended thinking (~20k+ chars)",
+    },
+    "gemini-4-carbon": {
+        "mode": 3, "think": 4,
+        "desc": "Gemini 4 Carbon - Frontier reasoning model (requires cookie for real routing)",
+    },
+    "gemini-auto": {
+        "mode": 4, "think": 4,
+        "desc": "Auto model selection (Gemini 4)",
+    },
+    # Short aliases
+    "gemini-hydrogen": {
+        "mode": 1, "think": 4,
+        "desc": "Alias for gemini-4-hydrogen",
+    },
+    "gemini-neon": {
+        "mode": 2, "think": 0,
+        "desc": "Alias for gemini-4-neon",
+    },
+    # Legacy / backward-compatible aliases
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
-        "desc": "Latest all-around model (Gemini 3.7 Flash)",
+        "desc": "Legacy alias for gemini-4-hydrogen",
     },
     "gemini-3.6-flash": {
         "mode": 1, "think": 4,
-        "desc": "All-around model (Gemini 3.6 Flash)",
+        "desc": "Legacy alias for gemini-4-hydrogen",
     },
     "gemini-3.5-flash": {
         "mode": 1, "think": 4,
-        "desc": "Alias for gemini-3.6-flash (backend upgraded)",
+        "desc": "Legacy alias for gemini-4-hydrogen",
     },
     "gemini-3.5-flash-thinking": {
         "mode": 2, "think": 0,
-        "desc": "Deep thinking mode, longest output (~20k chars)",
+        "desc": "Legacy alias for gemini-4-neon",
     },
     "gemini-3.1-pro": {
         "mode": 3, "think": 4,
@@ -116,9 +151,12 @@ def log(msg: str):
 def load_cookie() -> tuple:
     """Load cookie from file. Returns (cookie_str, sapisid)."""
     cookie_file = CONFIG.get("cookie_file")
-    if not cookie_file:
-        return "", None
-    if not os.path.exists(cookie_file):
+    if not cookie_file or not os.path.exists(cookie_file):
+        for candidate in ["cookies.txt", "cookie.txt", "cookie.json", "cookies.json"]:
+            if os.path.exists(candidate):
+                cookie_file = candidate
+                break
+    if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     try:
         with open(cookie_file, "r") as f:
@@ -756,10 +794,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
         think_override = None
         if "@think=" in model_name:
             model_name, think_str = model_name.rsplit("@think=", 1)
-            think_override = int(think_str)
+            try:
+                think_override = int(think_str)
+            except ValueError:
+                return None, None, None, f"Invalid think level: {think_str}"
         cfg = MODELS.get(model_name)
         if not cfg:
-            return None, None, None, f"Unknown model: {model_name}"
+            default = CONFIG.get("default_model", "gemini-4-hydrogen")
+            log(f"Unknown model '{model_name}', falling back to '{default}'")
+            model_name = default
+            cfg = MODELS.get(default, list(MODELS.values())[0])
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
     def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):

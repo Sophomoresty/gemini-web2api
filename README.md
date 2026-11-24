@@ -13,7 +13,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Optional API Keys**: no auth when `api_keys` is empty, OpenAI-style Bearer auth when configured
 - **OpenAI Compatible**: Drop-in replacement for `/v1/chat/completions` and `/v1/models`
 - **Tool Calling**: Full function calling support (OpenAI format)
-- **Multiple Models**: Flash (3.6), Extended Thinking (20k+ char output), Pro, Auto, Lite
+- **Multiple Models**: Gemini 4 Hydrogen (fast/efficient), Gemini 4 Neon (reasoning & thinking), Carbon, Auto, and legacy Flash aliases
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
 - **Cross-Platform**: Pure Python, single optional dependency (`httpx` for streaming)
@@ -38,7 +38,7 @@ Server starts at `http://localhost:8081/v1`.
 |-------|-------|
 | Base URL | `http://localhost:8081/v1` |
 | API Key | any `api_keys` value from `config.json`; anything if not configured |
-| Model | `gemini-3.5-flash-thinking` |
+| Model | `gemini-4-hydrogen` or `gemini-4-neon` |
 
 ### curl
 
@@ -48,13 +48,13 @@ Server starts at `http://localhost:8081/v1`.
 curl http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-key" \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"gemini-4-hydrogen","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
 #### PowerShell (Windows)
 
 ```powershell
-curl.exe --% http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer sk-your-key" -d "{\"model\":\"gemini-3.5-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}"
+curl.exe --% http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer sk-your-key" -d "{\"model\":\"gemini-4-hydrogen\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}"
 ```
 
 > Note: On Windows PowerShell, use `curl.exe` and `--%` so PowerShell does not reinterpret JSON quoting or curl options.
@@ -65,7 +65,7 @@ curl.exe --% http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: applica
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8081/v1", api_key="sk-your-key")
 resp = client.chat.completions.create(
-    model="gemini-3.5-flash-thinking",
+    model="gemini-4-neon",
     messages=[{"role": "user", "content": "Explain quantum computing"}]
 )
 print(resp.choices[0].message.content)
@@ -88,12 +88,19 @@ Supports Google native API endpoints:
 
 | Model | Description | Output |
 |-------|-------------|--------|
-| `gemini-3.6-flash` | All-around model (latest) | ~12k chars |
-| `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
-| `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
-| `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
+| `gemini-4-hydrogen` | High-efficiency workhorse model for speed and everyday coding (Default) | ~12k chars |
+| `gemini-4-hydrogen-thinking` | Gemini 4 Hydrogen with deep thinking enabled | ~15k chars |
+| `gemini-4-neon` | Mid-tier model for complex reasoning, analytical tasks and coding | ~20k chars |
+| `gemini-4-neon-thinking` | Gemini 4 Neon with extended thinking | **~20k+ chars** |
+| `gemini-4-carbon` | Frontier reasoning model (needs cookie for real routing) | ~12k chars |
+| `gemini-auto` | Auto model selection (Gemini 4) | varies |
+| `gemini-hydrogen` | Alias for gemini-4-hydrogen | ~12k chars |
+| `gemini-neon` | Alias for gemini-4-neon | ~20k chars |
+| `gemini-3.7-flash` | Legacy alias for gemini-4-hydrogen | ~12k chars |
+| `gemini-3.6-flash` | Legacy alias for gemini-4-hydrogen | ~12k chars |
+| `gemini-3.5-flash` | Legacy alias for gemini-4-hydrogen | ~12k chars |
+| `gemini-3.5-flash-thinking` | Legacy alias for gemini-4-neon | **~20k chars** |
 | `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
-| `gemini-auto` | Auto model selection | varies |
 | `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
 
 ### Thinking Depth
@@ -101,9 +108,9 @@ Supports Google native API endpoints:
 Append `@think=N` to any model name:
 
 ```
-gemini-3.5-flash-thinking@think=0   # deepest (default)
-gemini-3.5-flash-thinking@think=2   # medium
-gemini-3.5-flash-thinking@think=4   # shallowest
+gemini-4-neon@think=0   # deepest (default for thinking)
+gemini-4-neon@think=2   # medium
+gemini-4-neon@think=4   # shallowest
 ```
 
 ## Optional: Cookie for Pro
